@@ -1,5 +1,8 @@
 # Project HYPERION
 
+> **🤖 HANDOFF NOTE FOR OPENHANDS (`ransombiyato/hyperion-dbt` merge):**
+> Read **[`OPENHANDS_MERGE_GUIDE.md`](OPENHANDS_MERGE_GUIDE.md)** first! It lists every commit on both branches since `03487fc`, all **9 critical correctness/UB bugs** fixed here that must not regress during merge, the exact file-by-file conflict resolution table against `ransombiyato/hyperion-dbt` (`9f87e35`), and the full 8-gate verification script. *(Full-system PC / raw `.iso` booting now lives separately in [`ransombiyato/gallyx`](https://github.com/ransombiyato/gallyx).)*
+
 **An experimental x86-64 → AArch64 user-mode dynamic binary translator.**
 
 HYPERION explores how far a purpose-built, benchmark-driven dynamic binary

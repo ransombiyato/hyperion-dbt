@@ -1,5 +1,7 @@
 # Agent handoff
 
+> **🤖 OpenHands Merge Instructions:** Before doing anything else when merging `ransombiyato/hyperion-dbt-v2` into `ransombiyato/hyperion-dbt`, read **[`../OPENHANDS_MERGE_GUIDE.md`](../OPENHANDS_MERGE_GUIDE.md)** in full!
+
 **Read this first if you are a new AI agent continuing Project HYPERION.**
 
 This document tells you exactly where the project is, how to verify it, and
