@@ -140,6 +140,10 @@ public:
     // Unconditional B and conditional B.cond to a label.
     void b(Label target);
     void b_cond(Cond c, Label target);
+    // Branch to the address in `rn`. `blr` additionally writes the return
+    // address into X30 (LR), so generated code can call a runtime helper.
+    void br(Reg rn);
+    void blr(Reg rn);
     void ret(Reg rn = kLr);
     void nop();
 

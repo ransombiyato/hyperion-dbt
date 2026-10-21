@@ -403,6 +403,16 @@ void Encoder::ret(Reg rn) {
     emit(0xD65F0000u | (rn << 5)); // RET Xn
 }
 
+void Encoder::br(Reg rn) {
+    validate_reg(rn);
+    emit(0xD61F0000u | (rn << 5)); // BR Xn
+}
+
+void Encoder::blr(Reg rn) {
+    validate_reg(rn);
+    emit(0xD63F0000u | (rn << 5)); // BLR Xn (writes X30)
+}
+
 void Encoder::nop() {
     emit(0xD503201Fu);
 }

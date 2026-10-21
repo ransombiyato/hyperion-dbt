@@ -118,6 +118,19 @@ HYPERION_TEST("aarch64_encoder", "ret_and_nop") {
     HYPERION_CHECK_EQ(e.code()[1], 0xD503201Fu); // nop
 }
 
+HYPERION_TEST("aarch64_encoder", "br_and_blr_register_indirect") {
+    // Encodings verified against aarch64-linux-gnu-as: `br x9` = 0xd61f0120,
+    // `blr x10` = 0xd63f0140. blr writes the return address into X30, so
+    // generated code can call a runtime helper and RET back.
+    Encoder e;
+    e.br(9);
+    e.blr(10);
+    e.blr(8);
+    HYPERION_CHECK_EQ(e.code()[0], 0xD61F0120u); // br x9
+    HYPERION_CHECK_EQ(e.code()[1], 0xD63F0140u); // blr x10
+    HYPERION_CHECK_EQ(e.code()[2], 0xD63F0100u); // blr x8
+}
+
 HYPERION_TEST("aarch64_encoder", "forward_branch_patch") {
     // b <skip> ; nop ; skip: nop ; nop
     // skip is at instruction index 2, so the branch spans 2 instructions.
