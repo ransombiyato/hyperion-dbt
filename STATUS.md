@@ -609,6 +609,15 @@ unit cases under `qemu-user`) and `syscall.inventory_valid`.
 
 ### Remote verification (GitHub Actions)
 
+CI run `39582589833` on `main` (commit `609a002`, MOV memory operands via
+soft-MMU helpers): **conclusion `success`** — all six jobs passed:
+`clang-format` (7s), `AArch64 cross tests (qemu-user)` (49s), `ASan/UBSan` (28s),
+`syscall inventory & shellcheck` (12s), `build & test (clang)` (32s),
+`build & test (gcc)` (39s). The AArch64 job is the one that executes the
+generated helper-calling code under `qemu-user` and runs
+`translator.differential_memory_operands`. Push verified with
+`git ls-remote origin main` → `609a002`.
+
 CI run `39446173442` on `main` (commit `60114c7`, Phase 6 increment 4:
 `openat` + `fstat`): **conclusion `success`** — all six jobs passed:
 `clang-format`, `build & test (gcc)`, `build & test (clang)`, `ASan/UBSan`,
