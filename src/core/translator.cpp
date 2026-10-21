@@ -661,10 +661,16 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
                 e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_load));
                 emit_helper_call(e, 16, 1, fault); // value -> x0, fault -> x1
                 store_gpr_rb(e, ra, 0, insn.dst.reg);
-            } else {                                            // store: mov [mem], r64
+            } else {                                            // store: mov [mem], r64/imm32
                 emit_effective_address(e, insn.dst.mem, ra, 0); // x0 = address
-                load_gpr_rb(e, ra, insn.src.reg, 1);            // x1 = value
-                e.mov_imm64(2, bytes);                          // x2 = count
+                if (insn.src.kind == OperandKind::kImmediate) {
+                    // 0xC7 /0: the value is an imm32 (sign-extended for the
+                    // 64-bit form by the decoder). Materialise it directly.
+                    e.mov_imm64(1, insn.src.imm);
+                } else {
+                    load_gpr_rb(e, ra, insn.src.reg, 1); // x1 = value
+                }
+                e.mov_imm64(2, bytes); // x2 = count
                 e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_store));
                 emit_helper_call(e, 16, 0, fault); // return -> x0 (fault flag)
             }

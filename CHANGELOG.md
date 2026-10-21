@@ -5,6 +5,33 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — `0xC7 /0` (`mov r/m32/r/m64, imm32`)
+
+### Added
+- **Decoder support for `0xC7 /0`** in `src/core/decoder.cpp` — `mov r/m64,
+  imm32` (the immediate is sign-extended) and `mov r/m32, imm32` (zero-extended).
+  The destination may be a register or a memory operand. The other `/1`–`/7`
+  group encodings are rejected rather than silently misread as a move.
+- **Tests** — five decoder cases (`decoder.mov_rm_imm32_form`,
+  `…_sign_extends_in_64bit`, `…_is_not_sign_extended_in_32bit`, `…_to_memory`,
+  `rejects_mov_imm32_non_zero_reg_field`), a differential sign-extension case
+  (`differential.mov_imm32_sign_extends_in_64bit`), and a whole-program
+  two-tier differential (`translator.differential_mov_imm32_operands`).
+
+### Fixed
+- **Immediate source in the MOV memory-store path** (`src/core/translator.cpp`).
+  The store path unconditionally read `insn.src.reg`, which is meaningless when
+  the source is an immediate — a latent bug that only became reachable once
+  `0xC7 /0` could target memory. The value is now materialised directly into the
+  helper's argument register.
+
+### Changed
+- A real `gcc -static` x86-64 binary's `_start` now executes through the
+  `mov $0x4016e5,%rdi` at `0x4015d4` (this is exactly the `0xC7` form) and stops
+  at `0x4015db` on `67 e8` (`addr32 call`) instead of at `0x4015d4`.
+
+---
+
 ## [Unreleased] — ELF64 program-image loader (`hyperion info` / `run <elf>`)
 
 ### Added

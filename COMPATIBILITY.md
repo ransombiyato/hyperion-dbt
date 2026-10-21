@@ -43,6 +43,7 @@ here is rejected with a specific `DecodeError` — the decoder never guesses.
 | `mov r, r/m` | `0x8B` | 32, 64 | reg ← reg/mem |
 | `mov r/m, r` | `0x89` | 32, 64 | reg/mem ← reg |
 | `mov r, imm` | `0xB8+rd` | 32, 64 | 32-bit imm; 64-bit form reads 8-byte imm |
+| `mov r/m, imm` | `0xC7/0` | 32, 64 | imm32; sign-extended for the 64-bit form, zero-extended for the 32-bit form |
 | `add` | `0x01`, `0x03`, `0x81/0`, `0x83/0` | 32, 64 | r/m,r · r,r/m · imm32 · imm8(sx) |
 | `or` | `0x09`, `0x0B`, `0x81/1`, `0x83/1` | 32, 64 | as above |
 | `and` | `0x21`, `0x23`, `0x81/4`, `0x83/4` | 32, 64 | as above |

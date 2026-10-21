@@ -206,6 +206,52 @@ HYPERION_TEST("decoder", "rejects_adc_sbb_group") {
     HYPERION_CHECK(r.error == DecodeError::kUnknownOpcode);
 }
 
+HYPERION_TEST("decoder", "mov_rm_imm32_form") {
+    // 48 C7 C7 25 17 40 00 = mov rdi, 0x401725 (imm32 sign-extended).
+    // This is the instruction glibc's `_start` uses to load `main`.
+    const auto r = dec({0x48, 0xC7, 0xC7, 0x25, 0x17, 0x40, 0x00});
+    HYPERION_CHECK(r.ok());
+    HYPERION_CHECK(r.instruction.opcode == Opcode::kMov);
+    HYPERION_CHECK(r.instruction.dst.kind == OperandKind::kRegister);
+    HYPERION_CHECK(r.instruction.dst.reg == Gpr::kRdi);
+    HYPERION_CHECK(r.instruction.dst.size == hyperion::OperandSize::k64);
+    HYPERION_CHECK(r.instruction.src.kind == OperandKind::kImmediate);
+    HYPERION_CHECK(r.instruction.src.imm == 0x401725ULL);
+    HYPERION_CHECK(r.instruction.length == 7);
+}
+
+HYPERION_TEST("decoder", "mov_rm_imm32_sign_extends_in_64bit") {
+    // 48 C7 C0 F8 FF FF FF = mov rax, -8 (imm32 sign-extended to 64 bits).
+    const auto r = dec({0x48, 0xC7, 0xC0, 0xF8, 0xFF, 0xFF, 0xFF});
+    HYPERION_CHECK(r.ok());
+    HYPERION_CHECK(r.instruction.src.imm == 0xFFFFFFFFFFFFFFF8ULL);
+}
+
+HYPERION_TEST("decoder", "mov_rm_imm32_is_not_sign_extended_in_32bit") {
+    // C7 C0 F8 FF FF FF = mov eax, 0xFFFFFFF8 (no REX.W -> plain imm32).
+    const auto r = dec({0xC7, 0xC0, 0xF8, 0xFF, 0xFF, 0xFF});
+    HYPERION_CHECK(r.ok());
+    HYPERION_CHECK(r.instruction.dst.size == hyperion::OperandSize::k32);
+    HYPERION_CHECK(r.instruction.src.imm == 0x00000000FFFFFFF8ULL);
+}
+
+HYPERION_TEST("decoder", "mov_rm_imm32_to_memory") {
+    // 48 C7 03 2A 00 00 00 = mov qword ptr [rbx], 42 (mod=00 rm=011).
+    const auto r = dec({0x48, 0xC7, 0x03, 0x2A, 0x00, 0x00, 0x00});
+    HYPERION_CHECK(r.ok());
+    HYPERION_CHECK(r.instruction.opcode == Opcode::kMov);
+    HYPERION_CHECK(r.instruction.dst.kind == OperandKind::kMemory);
+    HYPERION_CHECK(r.instruction.src.kind == OperandKind::kImmediate);
+    HYPERION_CHECK(r.instruction.src.imm == 42ULL);
+}
+
+HYPERION_TEST("decoder", "rejects_mov_imm32_non_zero_reg_field") {
+    // 48 C7 C8 <imm32> = group 11 with reg=1, not MOV; rejected explicitly.
+    const auto r = dec({0x48, 0xC7, 0xC8, 0x01, 0x00, 0x00, 0x00});
+    HYPERION_CHECK(!r.ok());
+    HYPERION_CHECK(r.error == DecodeError::kUnknownOpcode);
+}
+
 HYPERION_TEST("decoder", "to_string_is_readable") {
     const auto r = dec({0x48, 0x01, 0xD8}); // add rax, rbx
     HYPERION_CHECK(r.ok());

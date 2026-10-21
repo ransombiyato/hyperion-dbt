@@ -729,6 +729,65 @@ HYPERION_TEST("translator", "differential_memory_operands") {
     HYPERION_CHECK_EQ(word, std::uint32_t{0x12345678});
 }
 
+HYPERION_TEST("translator", "differential_mov_imm32_operands") {
+    // The 0xC7 /0 form of MOV: `mov r/m64, imm32` (imm32 sign-extended) and
+    // `mov r/m32, imm32`. This is what glibc's `_start` uses to load `main`, so
+    // it must work in generated code as well as in the interpreter. Bytes
+    // verified with `as`/`objdump` (GNU binutils, Intel syntax):
+    //   mov rbx, 0x55667788      48 c7 c3 88 77 66 55
+    //   mov rcx, -1              48 c7 c1 ff ff ff ff
+    //   mov [rax], 42            48 c7 00 2a 00 00 00
+    //   mov [rax+8], -1          48 c7 40 08 ff ff ff ff
+    //   mov [rax+0x10], -8       48 c7 40 10 f8 ff ff ff
+    //   mov dword [rax+0x18], ... c7 40 18 78 56 34 12   (32-bit store)
+    //   hlt                      f4
+    const std::vector<std::uint8_t> program = {
+        0x48, 0xC7, 0xC3, 0x88, 0x77, 0x66, 0x55,       // mov rbx, 0x55667788
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,       // mov rcx, -1
+        0x48, 0xC7, 0x00, 0x2A, 0x00, 0x00, 0x00,       // mov qword [rax], 42
+        0x48, 0xC7, 0x40, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, // mov qword [rax+8], -1
+        0x48, 0xC7, 0x40, 0x10, 0xF8, 0xFF, 0xFF, 0xFF, // mov qword [rax+0x10], -8
+        0xC7, 0x40, 0x18, 0x78, 0x56, 0x34, 0x12,       // mov dword [rax+0x18], 0x12345678
+        0xF4,                                           // hlt
+    };
+    const std::uint64_t buffer = kBase + 0x100;
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRax) = buffer;
+
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial);
+
+    HYPERION_CHECK(actual.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(actual.steps, expected.steps);
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRbx), expected.state.reg(Gpr::kRbx));
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), expected.state.reg(Gpr::kRcx));
+    // The 64-bit immediate form must sign-extend: rbx keeps the positive imm32
+    // zero-extended, rcx becomes all ones.
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRbx), std::uint64_t{0x55667788});
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), std::uint64_t{0xFFFFFFFFFFFFFFFFULL});
+
+    std::uint64_t at_0 = 0;
+    std::uint64_t at_8 = 0;
+    std::uint64_t at_10 = 0;
+    std::uint32_t at_18 = 0;
+    HYPERION_CHECK(tier1_mem.read(buffer, reinterpret_cast<std::uint8_t*>(&at_0), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 8, reinterpret_cast<std::uint8_t*>(&at_8), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 0x10, reinterpret_cast<std::uint8_t*>(&at_10), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 0x18, reinterpret_cast<std::uint8_t*>(&at_18), 4));
+    HYPERION_CHECK_EQ(at_0, std::uint64_t{42});
+    HYPERION_CHECK_EQ(at_8, std::uint64_t{0xFFFFFFFFFFFFFFFFULL});
+    HYPERION_CHECK_EQ(at_10, std::uint64_t{0xFFFFFFFFFFFFFFF8ULL});
+    HYPERION_CHECK_EQ(at_18, std::uint32_t{0x12345678});
+}
+
 HYPERION_TEST("translator", "differential_memory_fault_is_reported") {
     // A translated load from an unmapped address must report a fault and stop
     // with rip on the faulting instruction, matching the interpreter. If the
@@ -896,6 +955,10 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
 }
 
 HYPERION_TEST("translator", "differential_memory_operands") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "differential_mov_imm32_operands") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

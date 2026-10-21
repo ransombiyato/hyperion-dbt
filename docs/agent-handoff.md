@@ -82,10 +82,12 @@ forms, the ALU read-modify-write forms (`add/sub/and/or/xor/cmp r,[m]` and
 `hyperion run <elf>` maps its `PT_LOAD` segments, zero-fills BSS, builds the
 startup stack with `rsp` 16-byte aligned, and starts it. Only **static** images
 load; a `PT_INTERP` image is refused with `ElfError::kNeedsInterpreter`. A real
-`gcc -static` binary therefore loads and starts, then stops at `0x4015c9`
-(`and rsp,-16`) with an honest `kUnsupported` — the guest stack
-(`push`/`pop`/`call`/`ret`) and RIP-relative addressing are still missing, so no
-real program runs end to end (LIM-020). The interpreter remains the only
+`gcc -static` binary therefore loads and starts, and now runs through `_start`
+as far as `0x4015db` (`67 e8`, `addr32 call __libc_start_main`) — it executes
+the `0xC7` `mov $0x4016e5,%rdi` at `0x4015d4` and then stops with an honest
+`kUnsupported` on the `0x67` prefix. The `0x67`-prefix acceptance, the guest
+stack (`push`/`pop`/`call`/`ret`) and RIP-relative addressing are still missing,
+so no real program runs end to end (LIM-020). The interpreter remains the only
 *complete* execution path. `STATUS.md` §4 lists the steps.
 
 **Two real defects were found and fixed in Phase 4**, both by testing: a block
@@ -208,9 +210,10 @@ verified to execute generated code under `qemu-user`. An **ELF64 loader** now
 exists: `hyperion info <elf>` describes a static image read-only and
 `hyperion run <elf>` maps its `PT_LOAD` segments, builds the startup stack, and
 starts it (a dynamically linked image is refused with a clear reason). The next
-concrete code-generation step is the **guest stack** (`push`/`pop`/`call`/`ret`),
-without which a real `_start` stops at `and rsp,-16`; then **RIP-relative
-addressing** (`[rip+disp]`), which the decoder still rejects. The next syscall
+concrete decoder step is **`0x67` (addr32) prefix acceptance**, which is what a
+real `_start` now stops on (`67 e8`, `addr32 call`); then the **guest stack**
+(`push`/`pop`/`call`/`ret`), without which no real `_start` can proceed; then
+**RIP-relative addressing** (`[rip+disp]`), which the decoder still rejects. The next syscall
 step is the remaining U4/E1 syscalls a real program needs to start
 (`arch_prctl`, `set_tid_address`, `rseq`).** Guest state, the
 decoder, the reference interpreter, the subset contract (`COMPATIBILITY.md` §2),
@@ -330,9 +333,16 @@ and pass.
     and refuses a `PT_INTERP` image. `hyperion info <elf>` and ELF-aware
     `hyperion run <elf>` added. 17 parser/mapper unit cases + a deterministic
     hostile-input robustness test + the `cli.elf` end-to-end test (D-033). A real
-    `gcc -static` binary loads at its true entry and stops at `0x4015c9`
-    (`and rsp,-16`) with an honest `kUnsupported` (LIM-020).
-18. **Next (Phase 3/4): the guest stack (`push`/`pop`/`call`/`ret`).** Model
+    `gcc -static` binary loads at its true entry and, after the `0xC7` increment
+    (item 18), stops at `0x4015db` (`67 e8`, `addr32 call`) with an honest
+    `kUnsupported` (LIM-020).
+18. **Next (Phase 3/4): `0x67` (addr32) prefix acceptance, then the guest stack
+    (`push`/`pop`/`call`/`ret`).** `0x67` is what a real `_start` now stops on:
+    `67 e8` is `call rel32` with a 32-bit address-size override, which is a no-op
+    for a target below 4 GiB, so accept the prefix in the scan (recording it for
+    the effective-address path's eventual truncation rule) and decode the
+    following opcode normally; add a decoder unit test and a `67 e8`/`ret`
+    round-trip differential. Then model
     `rsp` as an ordinary guest register in the effective-address path: a
     soft-MMU load/store at `rsp`, then the pointer adjust (push decrements
     before the store, pop loads before the increment). `call`/`ret` are a push
@@ -433,7 +443,19 @@ first CI performance-trend baseline.
 - **`cmake`, `ninja` and `shellcheck` are committed** under
   `tools/vendor/host-debs/` (19 MB of `.deb` files) and installed with
   `scripts/toolcache.sh install-host`. This is the recovery path that works from
-  a **fresh clone** with no network. `clang` is *not* vendored — it needs a
+  a **fresh clone** with no network. If the vendored `cmake` `.deb` cannot load
+  (its `libarchive13t64` dependency is unsatisfiable on some base images),
+  `install-host` now detects that and falls back to `pip install cmake`, which is
+  self-contained; it symlinks `cmake`/`ctest`/`cpack` into `/usr/bin`.
+- **The cached cross toolchain** (`tools/cache/toolchain/aarch64-toolchain.tar.gz`,
+  git-ignored, ~79 MB) is a full restore: the gcc/g++ driver *and* `-14` binaries,
+  every `aarch64-linux-gnu-*` binutil (including the `ld` → `ld.bfd` symlink
+  target), `/usr/aarch64-linux-gnu`, and `/usr/lib{,exec}/gcc-cross/aarch64-linux-gnu`
+  (`cc1`, `cc1plus`, `collect2`, `lto1`). Verified by wiping all of those paths and
+  restoring from the tarball alone, then running `scripts/dev.sh cross-test`
+  (7/7). If you change what is cached, keep the `aarch64-linux-gnu-*` **glob** —
+  an explicit list silently drops a symlink target and the restored toolchain
+  then fails to link. `clang` is *not* vendored — it needs a
   124 MB `libLLVM.so`, over GitHub's per-file limit — but it is not required to
   build or test; see `tools/vendor/host-debs/README.md`.
 - **Pushing:** the credential embedded in the `origin` URL can be stale and

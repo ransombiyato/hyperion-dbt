@@ -598,6 +598,47 @@ DecodeResult decode(const std::uint8_t* code, std::size_t size, std::uint64_t ad
         return result;
     }
 
+    // --- 0xC7 /0: MOV r/m32/r/m64, imm32 ----------------------------------
+    // The imm32 form of a move to a register or memory operand. glibc's
+    // `_start` uses it (`mov $main, %rdi`), so it is a prerequisite for
+    // running anything real. Only ModRM.reg == 0 is MOV; the other reg values
+    // are XBEGIN and other instructions this project does not model.
+    if (opcode == 0xC7) {
+        Modrm m;
+        const std::uint8_t modrm = r.u8();
+        m.mod = static_cast<std::uint8_t>(modrm >> 6);
+        m.reg = static_cast<std::uint8_t>((modrm >> 3) & 0x7);
+        m.rm = static_cast<std::uint8_t>(modrm & 0x7);
+
+        if (m.reg != 0) {
+            result.error = DecodeError::kUnknownOpcode; // XBEGIN and friends
+            return result;
+        }
+
+        Operand rm_op;
+        if (!decode_rm_operand(r, m, rex, op_size, rm_op)) {
+            result.error = r.truncated() ? DecodeError::kTruncated : DecodeError::kUnsupportedModrm;
+            return result;
+        }
+
+        Operand imm;
+        imm.kind = OperandKind::kImmediate;
+        imm.size = op_size;
+        if (op_size == OperandSize::k64) {
+            // imm32 sign-extended to 64 bits, exactly as the ALU group does.
+            const std::int32_t v = r.i32();
+            imm.imm = static_cast<std::uint64_t>(static_cast<std::int64_t>(v));
+        } else {
+            imm.imm = r.u32();
+        }
+
+        insn.dst = rm_op;
+        insn.src = imm;
+        insn.has_src = true;
+        finish(Opcode::kMov);
+        return result;
+    }
+
     // --- 0xB8..0xBF: MOV r32/r64, imm32/imm64 ------------------------------
     if (opcode >= 0xB8 && opcode <= 0xBF) {
         Operand dst;

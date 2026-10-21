@@ -81,10 +81,31 @@ works, what was last verified, and what to do next.
 now loads the image and starts executing it — and then stops at the first
 instruction the small subset does not cover, with an honest `kUnsupported`
 (verified: a real `gcc -static` hello-world loads at its real entry `0x4015c0`,
-sets up `rsp`, and stops at `0x4015c9` — `and rsp, -16` — which the translator
-does not yet lower). It does **not** run real programs; that needs RIP-relative
-addressing, the guest stack (`push`/`pop`/`call`/`ret`), and more syscalls
-(`arch_prctl` FS-base setup in particular). See LIM-020/021 and COMPATIBILITY.md.
+sets up `rsp`, and — after the `0xC7` increment in §0g — runs as far as `0x4015db`
+— `67 e8` (`addr32 call __libc_start_main`) — which the decoder does not yet
+accept). It does **not** run real programs; that needs `67`-prefix acceptance,
+the guest stack (`push`/`pop`/`call`/`ret`), RIP-relative addressing, and more
+syscalls (`arch_prctl` FS-base setup in particular). See LIM-020/021 and
+COMPATIBILITY.md.
+
+---
+
+## 0g. `0xC7 /0` (`mov r/m32/r/m64, imm32`) — this increment
+
+| Work item | State |
+| --- | --- |
+| 1. Decode `0xC7 /0` (register and memory destinations) | **Done & tested** — `src/core/decoder.cpp`; `imm32` is sign-extended for the 64-bit form, zero-extended for the 32-bit form; a non-zero `reg` field (the `/1`–`/7` group encodings) is rejected rather than misread |
+| 2. Translate the register form | **Done & tested** — routes through the existing MOV immediate path, including straight into an allocated host register |
+| 3. Translate the memory form | **Done & fixed** — the store path assumed a register source and read `insn.src.reg`; an immediate source is now materialised directly into `x1` before the `hyperion_store` helper call |
+| 4. Decoder unit tests | **Done** — `decoder.mov_rm_imm32_form`, `…_sign_extends_in_64bit`, `…_is_not_sign_extended_in_32bit`, `…_to_memory`, `rejects_mov_imm32_non_zero_reg_field` |
+| 5. Differential test (both tiers agree) | **Done** — `translator.differential_mov_imm32_operands`: register (positive + sign-extended negative), 64-bit memory stores, and a 32-bit memory store, all compared against the interpreter oracle |
+| 6. End-to-end evidence | **Done** — a real `gcc -static` binary's `_start` uses `48 c7 c7 e5 16 40 00` (`mov $0x4016e5,%rdi`); Tier 0 now executes it and advances to `0x4015db` |
+
+**Why it mattered.** This is the form glibc's `_start` uses to load `main` into
+`rdi`. Before it, a real binary stopped at `0x4015d4`; now the same binary
+reaches `0x4015db`. The memory-store bug it exposed was latent — unreachable
+until an immediate could be a store source — and is now covered by a test in both
+tiers.
 
 ---
 
@@ -671,6 +692,8 @@ commit `454c546`): native 125/0, cross 140/0, ASan/UBSan 9/9, CI run
 | ALU immediate folding (AArch64) | `translator.alu_immediate_is_folded` | PASS — foldable immediate is strictly smaller than a materialised one |
 | Register allocation, many registers (AArch64) | `translator.differential_register_allocation_many_registers` | PASS — 11-register program matches the interpreter instruction-for-instruction, including `rip` |
 | Register allocation, immediates (AArch64) | `translator.differential_register_allocation_immediates` | PASS — allocated destination written by `mov` imm then read |
+| `0xC7 /0` MOV imm32 (native) | `decoder.mov_rm_imm32_*` (5 cases) | PASS — register + memory forms, sign-extension in 64-bit, zero-extension in 32-bit, `/1`–`/7` rejected |
+| `0xC7 /0` MOV imm32 (AArch64) | `translator.differential_mov_imm32_operands` under qemu | PASS — register and 64-/32-bit memory stores all match the interpreter oracle |
 | Guest address space (native) | `address_space.*` unit cases | PASS — map/read/write, permission denial, `brk` growth, page-granular checks |
 | Memory syscalls (native) | `syscall.mmap_*`, `syscall.mprotect_*`, `syscall.munmap_*`, `syscall.brk_*` | PASS — anonymous mapping usable, file-backed → `-ENOSYS`, no-address-space → `-ENOSYS`, `-EINVAL` cases |
 | mmap end-to-end (native, Tier 0) | `syscall.mmap_end_to_end_under_the_interpreter` | PASS — guest mmaps a page, stores a byte through the returned pointer, value readable |
@@ -686,14 +709,14 @@ commit `454c546`): native 125/0, cross 140/0, ASan/UBSan 9/9, CI run
 | UML feasibility (smoke) | `experiments/uml/run.sh smoke` | PASS — kernel boots unprivileged; all 6 namespace types OK |
 | UML feasibility (systemd) | `experiments/uml/run.sh systemd` | PASS — systemd 257 as PID 1 → `multi-user.target` |
 
-The native suite is 9 CTest entries: `unit.native` (one entry running **136**
-unit test cases across 12 files), `differential.native_vs_interpreter` (**8**
-cases compared against real x86-64 hardware), `syscall.inventory_valid`,
-`cli.smoke`, `tier_bench.smoke`, `bench.smoke`, `bench.methodology`,
+The native suite is 11 CTest entries: `unit.native` (one entry running **239**
+registered unit test cases across 13 files; 222 pass, 17 skip on x86-64),
+`differential.native_vs_interpreter` (compared against real x86-64 hardware),
+`syscall.inventory_valid`, `cli.smoke`, `cli.elf`, `cli.wrapper`,
+`tier_bench.smoke`, `bench.smoke`, `bench.methodology`,
 `bench.timing_not_eliminated` and `bench.rejects_single_sample`. The cross build
-(`build/cross-test`) has 5 entries: `unit.native`, `cli.smoke`,
-`differential.native_vs_interpreter`, `cross.aarch64_tests` (which runs **153**
-unit cases under `qemu-user`) and `syscall.inventory_valid`.
+(`build/cross-test`) has 7 entries and runs **246** registered unit cases under
+`qemu-user` (244 pass, 2 skip — the 2 are the x86-64-only differential cases).
 
 ### Remote verification (GitHub Actions)
 
@@ -890,27 +913,34 @@ syscall slice (`statx`) is implemented and tested in both tiers. Phase 5 has six
 accepted, measured optimizations (BENCHMARKS.md §4.2.1–4.2.6). The ELF64 loader
 is done: `hyperion info`/`run <elf>` load a static image and start it (see §0f).**
 
-The single best next action is now a **code-generator** one, because the loader
-made the gap explicit and it is what actually blocks running a real binary:
+The single best next action is now a **decoder** one, because a real static
+binary's `_start` is one instruction away from being translatable:
 
-- **The guest stack (`push`/`pop`/`call`/`ret` with `rsp`).** A real static
-  binary's `_start` begins with `xor ebp,ebp; mov r9,rdx; pop rsi; mov rdx,rsp;
-  and rsp,-16; push rax; push rsp; …; call __libc_start_main`. Hyperion loads it
-  and stops at `and rsp,-16` (`0x4015c9`) — it does not lower `and r64, imm`, and
-  more importantly `pop`/`push`/`call`/`ret` do not exist yet. Implement them with
-  `rsp` as an ordinary guest register in the effective-address path (a soft-MMU
-  load/store at `rsp`, then the pointer adjust), keep the reference interpreter
-  as the oracle, and add a focused differential per form plus a whole-program
-  differential for a `call`/`ret` round trip. This is the increment that turns
-  "blocks" into "programs".
+- **`67 e8` (addr32 `call`).** With `0xC7 /0` (`mov r/m, imm32`) now decoded and
+  translated, `/tmp/hw_static` (a static glibc x86-64 binary) runs from
+  `0x4015c0` through the `mov $0x4016e5,%rdi` at `0x4015d4` and now stops at
+  `0x4015db` on `67 e8 4f 26 00 00` (`addr32 call __libc_start_main`) with
+  "unsupported prefix". The `0x67` operand-size prefix is a no-op for a
+  `call rel32` whose target is below 4 GiB, so the smallest correct change is to
+  accept `0x67` in the prefix scan and decode the following opcode normally
+  (record it so the effective-address path can apply the 32-bit-truncation rule
+  when it is eventually needed for addressing). Add a decoder unit test and a
+  whole-program differential for a `67 e8`/`ret` round trip.
 
 Then, in parallel and also code-gen:
 
+- **The guest stack (`push`/`pop`/`call`/`ret` with `rsp`).** `_start` needs
+  `pop rsi` (already reached past it) and ultimately `call`/`ret`. Implement them
+  with `rsp` as an ordinary guest register in the effective-address path (a
+  soft-MMU load/store at `rsp`, then the pointer adjust), keep the reference
+  interpreter as the oracle, and add a focused differential per form plus a
+  whole-program differential for a `call`/`ret` round trip. This is the increment
+  that turns "blocks" into "programs".
 - **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
   rejects (`kUnsupportedOperand`). Ubiquitous in position-independent code, so
   the biggest single decoder gap, and a small self-contained change.
-- **`and r64, imm` / the remaining ALU immediates** in the translator, which is
-  literally the instruction the real `_start` stops on.
+- **`and r64, imm` / the remaining ALU immediates** in the translator; the real
+  `_start` uses `and rsp,-16`.
 
 Then, larger Phase 6/7 work (independent):
 

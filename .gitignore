@@ -35,9 +35,18 @@ benchmarks/results/*.local.json
 # Release packaging output (scripts/package.sh). Reproducible; never committed.
 dist/
 
-# Repo-local tool cache (scripts/toolcache.sh). Binaries and toolchain archives
-# are large and machine-specific; they are never committed.
-tools/cache/
+# Repo-local tool cache (scripts/toolcache.sh).
+#
+# The two restore artefacts — the AArch64 cross toolchain tarball and the static
+# qemu-aarch64 — are COMMITTED so a fresh clone can restore a full, working
+# toolchain offline (the toolchain must live in the repo, not only on one
+# machine). Everything else the cache may hold is large and machine-specific and
+# is ignored.
+tools/cache/*
+!tools/cache/toolchain/
+!tools/cache/bin/
+tools/cache/bin/*
+!tools/cache/bin/qemu-aarch64-static
 
 # UML feasibility experiments (large, regenerable via experiments/uml/run.sh)
 .uml-rootfs/

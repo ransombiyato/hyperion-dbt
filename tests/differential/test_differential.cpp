@@ -152,6 +152,17 @@ std::vector<std::uint8_t> enc64_r_rm(std::uint8_t opcode) {
 std::vector<std::uint8_t> enc64_rm_imm8(std::uint8_t ext, std::uint8_t imm) {
     return {0x48, 0x83, static_cast<std::uint8_t>(0xC0 | (ext << 3)), imm, 0xF4};
 }
+// Encode `mov r/m64, imm32` (0xC7 /0) into rax: ModRM = 11 000 000 = 0xC0.
+std::vector<std::uint8_t> enc64_mov_rax_imm32(std::uint32_t imm) {
+    return {0x48,
+            0xC7,
+            0xC0,
+            static_cast<std::uint8_t>(imm & 0xFF),
+            static_cast<std::uint8_t>((imm >> 8) & 0xFF),
+            static_cast<std::uint8_t>((imm >> 16) & 0xFF),
+            static_cast<std::uint8_t>((imm >> 24) & 0xFF),
+            0xF4};
+}
 
 // Flag inputs chosen to exercise carry/overflow/zero/sign/parity in different
 // combinations. Bit 1 is always set, as on real hardware.
@@ -335,7 +346,24 @@ HYPERION_TEST("differential", "thirty_two_bit_ops_zero_extend") {
 #endif
 }
 
-// The 0x83 form takes an imm8 sign-extended to the operand size.
+// The 0xC7 /0 form takes an imm32 sign-extended to the operand size.
+HYPERION_TEST("differential", "mov_imm32_sign_extends_in_64bit") {
+#if defined(__x86_64__)
+    // 48 C7 C0 <imm32> = mov rax, imm32. The 64-bit form sign-extends, so a
+    // value with bit 31 set must land in rax as 0xFFFFFFFF________. A decoder
+    // that zero-extends instead is a classic bug and this catches it.
+    for (const std::uint32_t imm :
+         {0x00000001u, 0x0000002Au, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu}) {
+        const GuestState actual = interp(enc64_mov_rax_imm32(imm), 0, 0, kRflagsBit1);
+        const std::uint64_t expected =
+            static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(imm)));
+        HYPERION_CHECK_EQ(actual.reg(Gpr::kRax), expected);
+    }
+#else
+    HYPERION_SKIP("requires an x86-64 host to execute the reference instructions");
+#endif
+}
+
 HYPERION_TEST("differential", "alu_imm8_sign_extends") {
 #if defined(__x86_64__)
     // 0x01 -> +1, 0xFF -> -1 (must sign-extend to 0xFFFFFFFFFFFFFFFF, not
