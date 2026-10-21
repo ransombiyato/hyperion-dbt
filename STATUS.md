@@ -54,6 +54,15 @@ not run a real Linux program (LIM-020/021).
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
 
+> **Handoff readiness (2026-10-21).** The repository is self-contained: the
+> AArch64 cross toolchain tarball and the static `qemu-aarch64` are **committed**
+> under `tools/cache/`, and `cmake`/`ninja`/`shellcheck` are committed as `.deb`s
+> under `tools/vendor/host-debs/`, so a fresh clone builds and tests **offline**.
+> Verified end to end: `git clone` → `toolcache.sh install-host` →
+> `toolcache.sh restore` → `dev.sh build` → `dev.sh test` (11/11) →
+> `dev.sh cross-test` (7/7). CI run `39606893677` on `main` is green (all six
+> jobs). A new agent can start at README "If you are a new agent: start here".
+
 > **Environment recovery (read this first after a container reset).** `/usr`
 > does not persist. Run `scripts/toolcache.sh install-host` (cmake/ninja/
 > shellcheck from committed debs, works offline from a fresh clone), then
@@ -1025,13 +1034,18 @@ performance-trend baseline), but neither blocks Phase 5.
 ## 5. Exact commands to reproduce this state
 
 ```bash
-scripts/bootstrap.sh            # one-time toolchain install + repo tool cache (needs sudo)
-scripts/toolcache.sh restore    # after a container reset: reinstate the cached toolchain
+# Fresh clone (no package mirror needed): the toolchain is IN the repo.
+scripts/toolcache.sh install-host   # cmake/ninja/shellcheck from committed debs
+scripts/toolcache.sh restore        # AArch64 cross toolchain from the committed tarball
+scripts/dev.sh build                # configures on first use
+scripts/dev.sh test                 # native tests  (expect: 11/11)
+scripts/dev.sh cross-test           # AArch64 under qemu-user (expect: 7/7)
+
+# Full rebuild from source (needs sudo + network), if the cache is ever wrong
+scripts/bootstrap.sh            # one-time toolchain install + repo tool cache
 scripts/toolcache.sh status     # what is cached
 scripts/dev.sh bootstrap        # configure
-scripts/dev.sh build            # build
-scripts/dev.sh test             # native tests
-scripts/dev.sh cross-test       # AArch64 tests under qemu-user
+scripts/dev.sh sanitize         # ASan/UBSan suite (expect: 11/11)
 scripts/dev.sh bench --iterations 1000000 --repeats 9 --json
 scripts/bench-tier-qemu.sh --iterations 200000 --repeats 7        # Tier 0 vs Tier 1 (narrow loop)
 scripts/bench-tier-qemu.sh --wide --iterations 100000 --repeats 7 # register-allocation workload

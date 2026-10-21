@@ -144,14 +144,20 @@ usually broken, and this project requires evidence, not plausible numbers.
 
 ## 3. Verify the current state (do this first)
 
+A fresh clone is self-contained: the toolchain is **in the repo**, so the first
+two lines below work with no package mirror. This exact sequence was verified
+end to end on 2026-10-21 (native 11/11, cross 7/7).
+
 ```bash
 scripts/toolcache.sh install-host # fresh clone: cmake/ninja/shellcheck from committed debs
-scripts/toolcache.sh restore # after a container reset: cached cross toolchain + qemu (offline)
-scripts/bootstrap.sh        # full toolchain (sudo); skip if already installed
-scripts/dev.sh bootstrap
-scripts/dev.sh build
-scripts/dev.sh test         # expect: all tests passed
-scripts/dev.sh cross-test   # expect: all tests passed incl. cross.aarch64_tests
+scripts/toolcache.sh restore # AArch64 cross toolchain from the committed tarball (offline)
+scripts/dev.sh build        # configures on first use
+scripts/dev.sh test         # expect: 100% tests passed out of 11
+scripts/dev.sh cross-test   # expect: 100% tests passed out of 7
+scripts/dev.sh sanitize     # expect: 100% tests passed out of 11 (ASan/UBSan)
+
+# full rebuild from source, only if the committed cache is ever wrong (sudo+net)
+scripts/bootstrap.sh
 scripts/dev.sh clang-build  # expect: clean (needs clang; optional)
 ./build/dev/tests/hyperion_differential_tests   # expect: 8 passed, 0 skipped (x86-64)
 ./build/dev/hyperion version
