@@ -185,20 +185,23 @@ build.
 **Phases 0–4 are closed. Phase 5 is active (six optimizations accepted and
 measured: parity fast path, dead-`rip` elimination, flag liveness, direct-mapped
 dispatch, ALU immediate folding, guest-register allocation). Phase 6's syscall
-inventory is complete and CI-validated, and **seven** syscall slices are
+inventory is complete and CI-validated, and **ten** syscall slices are
 implemented and tested in both tiers: the first (`write`/`exit`/`exit_group`),
 the second (the guest address space plus `mmap`/`mprotect`/`munmap`/`brk`),
 the third (a guest descriptor table plus `read`/`close`/`lseek`),
 the fourth (`openat`/`fstat`), the fifth (the process-identity getters plus
-`getcwd`/`getrandom`), the sixth (`newfstatat`, glibc's stat entry point), and
+`getcwd`/`getrandom`), the sixth (`newfstatat`, glibc's stat entry point),
 the seventh (`access`/`readlink`), the eighth (`readlinkat`), the ninth
 (`getdents64`), and the tenth (`statx`).
 Memory operands are now translated in Tier 1 (MOV, ALU read-modify-write,
-INC/DEC, all via soft-MMU helpers), so the next concrete code-generation step is
-**RIP-relative addressing** (`[rip+disp]`), which the decoder still rejects and
-which real position-independent code uses constantly; the next syscall step is
-the remaining U4/E1 syscalls a real program needs to start (`arch_prctl`,
-`set_tid_address`, `rseq`).** Guest state, the
+INC/DEC, all via soft-MMU helpers), and the project now **ships prebuilt static
+binaries** (`scripts/package.sh`, `.github/workflows/release.yml`) that were
+verified to execute generated code under `qemu-user`. The next concrete
+code-generation step is an **ELF64 loader** (there is still no way to load a real
+executable; STATUS.md §4), followed by **RIP-relative addressing** (`[rip+disp]`),
+which the decoder still rejects and which real position-independent code uses
+constantly; the next syscall step is the remaining U4/E1 syscalls a real program
+needs to start (`arch_prctl`, `set_tid_address`, `rseq`).** Guest state, the
 decoder, the reference interpreter, the subset contract (`COMPATIBILITY.md` §2),
 the hardware differential, the AArch64 encoder, executable memory,
 single-instruction translation, whole-block translation, the translation-cache

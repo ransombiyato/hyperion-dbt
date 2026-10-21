@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+# Project HYPERION release packaging.
+#
+# Triggered by a version tag (v*). Builds self-contained static binaries for
+# x86-64 and AArch64, runs the test suite first (a release is never published
+# from a build that fails its own tests), then attaches the tarballs and their
+# checksums to a GitHub Release.
+#
+# The AArch64 tarball is the artefact that matters for the reference device
+# (Qualcomm Snapdragon 855, Android 10, no root, no KVM): a single static
+# executable with no loader or shared-library dependency.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to label the release (e.g. 0.1.0)"
+        required: false
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  build:
+    name: build & verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            cmake ninja-build g++ \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            qemu-user
+
+      - name: Configure (tests on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DHYPERION_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and test
+        run: |
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: |
+          scripts/package.sh --out dist
+
+      - name: Smoke-test the packaged binaries
+        run: |
+          set -euo pipefail
+          # x86-64 tarball runs natively.
+          tar -xzf dist/hyperion-*-x86_64-linux.tar.gz -C dist
+          dist/hyperion-*-x86_64-linux/hyperion version
+          dist/hyperion-*-x86_64-linux/hyperion probe
+          # AArch64 tarball runs under qemu-user.
+          tar -xzf dist/hyperion-*-aarch64-linux.tar.gz -C dist
+          qemu-aarch64 dist/hyperion-*-aarch64-linux/hyperion version
+          qemu-aarch64 dist/hyperion-*-aarch64-linux/hyperion probe
+          # The AArch64 binary must really translate: tier 1 on a 3-instruction
+          # blob must report one translated block and the expected register.
+          printf '\x48\xb8\x01\x00\x00\x00\x00\x00\x00\x00\x48\x83\xc0\x02\xf4' > /tmp/t.bin
+          qemu-aarch64 dist/hyperion-*-aarch64-linux/hyperion run /tmp/t.bin --tier=1 --dump \
+            | grep -q 'rax =0x0000000000000003'
+
+      - name: Verify checksums
+        run: |
+          cd dist && sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperion-release-tarballs
+          path: |
+            dist/hyperion-*.tar.gz
+            dist/SHA256SUMS
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyperion-release-tarballs
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes="$(printf '%s\n' \
+            "Experimental pre-release of Project HYPERION, an x86-64 to AArch64" \
+            "user-mode dynamic binary translator." \
+            "" \
+            "This is a research prototype. See STATUS.md and COMPATIBILITY.md in" \
+            "the source tree for exactly what is implemented and what is not." \
+            "" \
+            "Static binaries (no loader or shared-library dependency):" \
+            "  - hyperion-*-x86_64-linux.tar.gz   (runs on any x86-64 Linux)" \
+            "  - hyperion-*-aarch64-linux.tar.gz  (runs on AArch64 Linux / Android)" \
+            "" \
+            "Verify with: sha256sum -c SHA256SUMS")"
+          gh release create "${tag}" \
+            --title "HYPERION ${tag}" \
+            --notes "${notes}" \
+            --prerelease \
+            dist/hyperion-*.tar.gz dist/SHA256SUMS

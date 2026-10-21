@@ -34,6 +34,14 @@ Unimplemented numbers still
 return `-ENOSYS` explicitly. The guest instruction subset remains small; see
 COMPATIBILITY.md.**
 
+**Distribution:** the project now ships prebuilt **static** binaries. Every
+tagged release builds `hyperion-<version>-{x86_64,aarch64}-linux.tar.gz` plus
+`SHA256SUMS` via `.github/workflows/release.yml` and `scripts/package.sh`; the
+AArch64 tarball is the artefact the reference device needs (one file, no loader,
+no shared libraries, no root). The packaged AArch64 binary was verified under
+`qemu-user` to really translate and execute (`--tier=1`, one block, `rax=3`).
+See README "Getting a binary without building anything".
+
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
 
@@ -475,6 +483,17 @@ removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
 | Lint | `shellcheck scripts/*.sh tests/cli/*.sh` | clean |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 
+Re-verified after the **release-packaging** increment (static tarballs + release
+workflow): native **10/10 ctest** (195 unit cases, 0 failed, 17 skipped); cross
+**216/0**, 2 skipped (of 218) under `qemu-user`; format clean; shellcheck clean
+(now including `scripts/package.sh`). The packaged artefacts were **executed**,
+not assumed: `dist/hyperion-0.1.0-x86_64-linux.tar.gz` runs natively
+(`version`, `probe`), and `dist/hyperion-0.1.0-aarch64-linux.tar.gz` was run
+under `qemu-aarch64` where `hyperion run <blob> --tier=1` reported
+`1 basic block(s) translated`, `status: ok`, `rax =0x0000000000000003` — i.e.
+the shipped AArch64 binary really executes generated code, it is not a stub.
+`sha256sum -c SHA256SUMS` verified both tarballs.
+
 Re-verified after the **ALU / INC/DEC memory-operand** increment: native
 **195/0**, 17 skipped (of 212); cross **216/0**, 2 skipped (of 218) under
 `qemu-user`; ASan/UBSan **10/10 ctest**; clang-build **10/10 ctest**; format
@@ -810,11 +829,37 @@ stable-vs-noisy discrimination case).
 
 ## 4. Immediate next task
 
-**Phase 6's tenth syscall slice (`statx`) is implemented and tested in both
-tiers. Phase 5 has six accepted, measured optimizations
-(BENCHMARKS.md §4.2.1–4.2.6), all deterministic-evidence based.**
+**Release packaging is done: static x86-64 and AArch64 tarballs build
+reproducibly (`scripts/package.sh`), a tag-triggered workflow publishes them
+with checksums, and both artefacts were executed and verified. Phase 6's tenth
+syscall slice (`statx`) is implemented and tested in both tiers. Phase 5 has six
+accepted, measured optimizations (BENCHMARKS.md §4.2.1–4.2.6).**
 
-The single best next action (Phase 6, extend coverage in U4 order):
+The single best next action is now a **code-generator** one, because it is the
+biggest real blocker to running anything from a filesystem and is
+self-contained:
+
+- **ELF64 loader + `hyperion info`.** There is still no loader, so `hyperion run`
+  only accepts a raw blob. Parse the ELF64 header and program headers, validate
+  them strictly (class, machine, endianness, bounds, `p_filesz <= p_memsz`,
+  no overlapping/invalid `PT_LOAD`), map each `PT_LOAD` into `GuestAddressSpace`
+  with the right permissions, and set up an initial guest stack. Then
+  `hyperion info <elf>` describes an image, and `hyperion run <elf>` maps it.
+  This is a prerequisite for the ISO question's *user-mode* reading (see
+  `docs/iso-boot-investigation.md`) and for Phase 9. Test with a tiny
+  hand-written static ELF plus a real `gcc -static` hello-world (which will
+  still stop at the first unsupported instruction — that is an honest
+  `kUnsupported`, not a crash).
+
+Then, in parallel and also code-gen:
+
+- **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
+  rejects (`kUnsupportedOperand`). Ubiquitous in position-independent code, so
+  the biggest single decoder gap, and a small self-contained change.
+- **The guest stack** (`push`/`pop`/`call`/`ret` with rsp), which is what turns
+  "blocks" into "programs".
+
+Then, larger Phase 6/7 work (independent):
 
 - **Add the remaining U4/E1 syscalls a real program needs to start and run**:
   `arch_prctl`(158) (set up the thread-local/FS base — required before glibc

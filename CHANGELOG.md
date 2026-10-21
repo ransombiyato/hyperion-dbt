@@ -5,6 +5,39 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — Distribution: prebuilt static binaries and a release workflow
+
+### Added
+- **`scripts/package.sh`** — builds self-contained release tarballs for x86-64
+  and AArch64. Each tarball holds a **statically linked** `hyperion` (no loader,
+  no shared libraries), the licence and the three documents a first-time user
+  needs. Static linking is deliberate: the reference device is AArch64 Android
+  with no root, so a single self-contained file is the artefact that runs there.
+  Writes `dist/SHA256SUMS` (sha256sum or shasum).
+- **`.github/workflows/release.yml`** — on a `v*` tag: builds, runs the full
+  test suite (a release is never published from a build that fails its own
+  tests), packages both architectures, smoke-tests the packaged binaries
+  (including the AArch64 one under `qemu-user` with a real `--tier=1`
+  translation), verifies the checksums, and publishes a GitHub pre-release.
+- **`hyperion package`** — wrapper command for `scripts/package.sh`.
+- **`docs/iso-boot-investigation.md`** — records the ISO/boot experiment and its
+  honest negative result (see Changed).
+
+### Changed
+- `README.md`: new "Getting a binary without building anything" section.
+- `scripts/hyperion`: `status` no longer understates the project (memory
+  operands in Tier 1 are listed; the stale "seven slices" count corrected to
+  ten); `help` advertises `package`.
+- `tests/cli/wrapper_test.sh`: asserts `help` advertises `package`.
+- `.gitignore`: ignores `dist/` (reproducible packaging output).
+
+### Notes
+- No target-device performance claim is made. The AArch64 tarball was verified
+  to *execute generated code* under `qemu-user`; `qemu-user` is not a
+  performance measurement (LIM-004).
+
+---
+
 ## [Unreleased] — Phase 6/7: ALU and INC/DEC memory operands (soft MMU)
 
 ### Added

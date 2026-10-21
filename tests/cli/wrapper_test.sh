@@ -39,6 +39,12 @@ if ! grep -q 'run <exe>' <<<"$(bash "${WRAPPER}" help)"; then
     fail "'help' does not advertise the run command"
 fi
 
+# `help` must advertise the packaging command too: it is how a user gets a
+# binary without a toolchain (see README "Getting a binary without building").
+if ! grep -q '^  package ' <<<"$(bash "${WRAPPER}" help)"; then
+    fail "'help' does not advertise the package command"
+fi
+
 # `run` must delegate to the binary, not print NOT IMPLEMENTED.
 BLOB="$(mktemp)"
 trap 'rm -f "$BLOB"' EXIT

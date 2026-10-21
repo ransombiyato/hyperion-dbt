@@ -249,3 +249,37 @@ time budget, with longer runs on demand.
 A red CI job blocks merging. Never mark a milestone complete while CI is failing.
 Run `scripts/dev.sh clang-build` locally before pushing: a gcc-clean tree can
 still fail the clang job.
+
+`.github/workflows/release.yml` runs on a `v*` tag (or manually): it builds,
+runs the full test suite, packages both architectures with `scripts/package.sh`,
+smoke-tests the packaged binaries (the AArch64 one under `qemu-user`, with a real
+`--tier=1` translation whose result is checked), verifies `SHA256SUMS`, and
+publishes a GitHub pre-release. A release is never published from a build that
+fails its own tests.
+
+---
+
+## 11. Release packaging (local)
+
+```bash
+scripts/package.sh              # dist/hyperion-<v>-{x86_64,aarch64}-linux.tar.gz + SHA256SUMS
+scripts/package.sh --no-cross   # x86-64 only (no cross compiler required)
+hyperion package                # same, via the wrapper
+```
+
+To verify a tarball by hand, exactly as the release workflow does:
+
+```bash
+tar -xzf dist/hyperion-<v>-x86_64-linux.tar.gz -C dist
+dist/hyperion-<v>-x86_64-linux/hyperion version          # runs natively
+tar -xzf dist/hyperion-<v>-aarch64-linux.tar.gz -C dist
+qemu-aarch64 dist/hyperion-<v>-aarch64-linux/hyperion version
+printf '\x48\xb8\x01\x00\x00\x00\x00\x00\x00\x00\x48\x83\xc0\x02\xf4' > /tmp/t.bin
+qemu-aarch64 dist/hyperion-<v>-aarch64-linux/hyperion run /tmp/t.bin --tier=1 --dump
+# must report: 1 basic block(s) translated / status: ok / rax =0x0000000000000003
+(cd dist && sha256sum -c SHA256SUMS)
+```
+
+The last check is the one that matters: it proves the shipped AArch64 binary
+really translates and executes generated code rather than being a stub. It is
+*not* a performance measurement (`qemu-user` is not the target hardware).

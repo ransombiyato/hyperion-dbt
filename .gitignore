@@ -32,6 +32,9 @@ venv/
 benchmarks/results/*.local.json
 .agent_tmp/
 
+# Release packaging output (scripts/package.sh). Reproducible; never committed.
+dist/
+
 # Repo-local tool cache (scripts/toolcache.sh). Binaries and toolchain archives
 # are large and machine-specific; they are never committed.
 tools/cache/

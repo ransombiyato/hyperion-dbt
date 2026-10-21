@@ -89,10 +89,11 @@ tests/run_cross_tests.cmake  Cross-arch validation driver
 tests/bench_rejects_bad_args.cmake  Negative test for the benchmark harness
 benchmarks/             Benchmark harness
 experiments/            Feasibility experiments (NOT part of the translator)
-scripts/                Developer task runner, env bootstrap, `hyperion` CLI
+scripts/                Developer task runner, env bootstrap, `hyperion` CLI,
+                        release packaging (package.sh)
 install.sh              One-line installer (curl | bash)
 docs/                   Agent handoff, known issues, target environment
-.github/workflows/      CI
+.github/workflows/      CI (ci.yml) and release packaging (release.yml)
 ```
 
 Documentation index:
@@ -116,6 +117,7 @@ Documentation index:
 | [`docs/target-environment.md`](docs/target-environment.md) | Reference device and host matrix |
 | [`docs/glossary.md`](docs/glossary.md) | Terminology used in this project |
 | [`docs/architecture-feasibility.md`](docs/architecture-feasibility.md) | Scope analysis: user-mode vs system-mode vs hybrid, with measured evidence |
+| [`docs/iso-boot-investigation.md`](docs/iso-boot-investigation.md) | Why HYPERION cannot boot an ISO/disk image (verified negative result) |
 
 ---
 
@@ -147,6 +149,35 @@ less install.sh && bash install.sh
 ```
 
 To remove it again: `bash install.sh --uninstall --prefix ~/.local`.
+
+### Getting a binary without building anything
+
+If you would rather not install a compiler, every tagged release ships
+**static** binaries — a single file with no loader or shared-library
+dependency, which is what the reference device (AArch64 Android, no root)
+needs. Download the tarball for your architecture from the
+[releases page](https://github.com/ransombiyato/hyperion-dbt/releases):
+
+```bash
+# x86-64 or aarch64, whichever matches your machine.
+tar -xzf hyperion-<version>-aarch64-linux.tar.gz
+./hyperion-<version>-aarch64-linux/hyperion version
+./hyperion-<version>-aarch64-linux/hyperion probe
+```
+
+`SHA256SUMS` accompanies every release; verify with `sha256sum -c SHA256SUMS`.
+
+To build the same tarballs yourself from a checkout:
+
+```bash
+scripts/package.sh            # writes dist/*.tar.gz and dist/SHA256SUMS
+scripts/package.sh --no-cross # x86-64 only (no cross compiler needed)
+```
+
+The packaged AArch64 binary is a real translator, not a stub: under
+`qemu-user` it reports one translated block and the expected result for a
+three-instruction blob (`--tier=1`). No target-device performance number is
+claimed, because none has been measured (see `BENCHMARKS.md`).
 
 > **`hyperion run` works, with a small instruction subset.** It loads a
 > flat x86-64 blob (not an ELF executable — there is no ELF loader yet),

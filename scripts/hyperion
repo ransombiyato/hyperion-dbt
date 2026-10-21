@@ -75,6 +75,8 @@ build and test
   test          run the test suite
   bench         run the benchmark harness
   cross-test    build and run the AArch64 tests under qemu-user (if available)
+  package       build static release tarballs into dist/ (no toolchain needed
+                to run them)
   clean         remove this install's build tree
 
 paths
@@ -111,7 +113,7 @@ Phase 2  minimal instruction exec    IN PROGRESS (subset)
 Phase 3  first native code gen       IN PROGRESS
 Phase 4  basic dynamic translator    CORE DONE
 Phase 5  performance and opt         IN PROGRESS
-Phase 6  Linux ABI / syscalls        IN PROGRESS (seven slices)
+Phase 6  Linux ABI / syscalls        IN PROGRESS (ten slices)
 Phase 7+ advanced CPU compatibility  NOT STARTED
 
 IMPLEMENTED
@@ -121,12 +123,15 @@ IMPLEMENTED
   - AArch64 cross-build + test under qemu-user
   - x86-64 decoder + reference interpreter for a documented subset
   - AArch64 code generator and a block translation cache (tier 1)
+  - memory operands in tier 1 (mov / ALU read-modify-write / inc,dec) via a
+    soft-MMU runtime helper, with a fault reported rather than miscompiled
   - per-block guest-register allocation
   - a slice of Linux syscalls (see 'hyperion doctor' / STATUS.md)
 
 NOT IMPLEMENTED
   - loading a real ELF executable (only raw code blobs run)
-  - block chaining, cache invalidation, SIMD, signals, threads
+  - push/pop/call/ret, RIP-relative addressing, SIMD
+  - block chaining, cache invalidation, signals, threads
   - the `info` command
 
 A raw x86-64 code blob runs with 'hyperion run <file>' (tier 1 on an AArch64
@@ -214,6 +219,12 @@ cmd_cross_test() {
     ctest --test-dir "${dir}" --output-on-failure
 }
 
+cmd_package() {
+    need_checkout
+    [ -x "${SRC}/scripts/package.sh" ] || die "scripts/package.sh not found in ${SRC}"
+    exec "${SRC}/scripts/package.sh" "$@"
+}
+
 cmd_clean() {
     need_checkout
     say "Removing ${BUILD}"
@@ -244,6 +255,7 @@ case "${1:-}" in
     test)               cmd_test ;;
     bench)              shift; cmd_bench "$@" ;;
     cross-test)         cmd_cross_test ;;
+    package)            shift; cmd_package "$@" ;;
     clean)              cmd_clean ;;
     src)                say "${SRC}" ;;
     build-dir)          say "${BUILD}" ;;
