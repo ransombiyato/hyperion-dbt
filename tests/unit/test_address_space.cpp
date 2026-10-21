@@ -14,6 +14,8 @@
 
 #include "harness/test_harness.hpp"
 #include "hyperion/address_space.hpp"
+#include "hyperion/exec_mem.hpp"
+#include "hyperion/translation_cache.hpp"
 
 using hyperion::GuestAddressSpace;
 using hyperion::MemPerm;
@@ -137,13 +139,29 @@ HYPERION_TEST("address_space", "unmap_removes_the_mapping") {
     HYPERION_CHECK(!as.perm_at(*addr).has_value());
 }
 
-HYPERION_TEST("address_space", "unmap_of_a_partial_or_unmapped_range_fails") {
+HYPERION_TEST("address_space", "unmap_splits_regions_and_rejects_unmapped_ranges") {
     GuestAddressSpace as;
-    const auto addr = as.map_anonymous(2 * kPage, MemPerm::kRead | MemPerm::kWrite);
+    // Map a 3-page region [a, a + 3*kPage), write distinct markers on pages 0, 1, 2,
+    // punch a hole in the middle page [a + kPage, a + 2*kPage) (matching the
+    // ELF dynamic loader guard-page pattern), and verify pages 0 and 2 preserve
+    // their exact bytes while page 1 faults and a second unmap on the hole fails.
+    const auto addr = as.map_anonymous(3 * kPage, MemPerm::kRead | MemPerm::kWrite);
     HYPERION_CHECK(addr.has_value());
-    // Splitting a region is not supported in this increment: it must fail
-    // loudly rather than silently succeed with a different mapping.
-    HYPERION_CHECK(!as.unmap(*addr, kPage));
+    const std::uint8_t p0 = 0xAA;
+    const std::uint8_t p1 = 0xBB;
+    const std::uint8_t p2 = 0xCC;
+    HYPERION_CHECK(as.write(*addr, &p0, 1));
+    HYPERION_CHECK(as.write(*addr + kPage, &p1, 1));
+    HYPERION_CHECK(as.write(*addr + 2 * kPage, &p2, 1));
+
+    HYPERION_CHECK(as.unmap(*addr + kPage, kPage));
+    std::uint8_t out = 0;
+    HYPERION_CHECK(as.read(*addr, &out, 1) && out == 0xAA);
+    HYPERION_CHECK(!as.read(*addr + kPage, &out, 1));
+    HYPERION_CHECK(as.read(*addr + 2 * kPage, &out, 1) && out == 0xCC);
+
+    // Unmapping an unmapped range fails cleanly.
+    HYPERION_CHECK(!as.unmap(*addr + kPage, kPage));
     HYPERION_CHECK(!as.unmap(0x900000, kPage));
 }
 
@@ -225,8 +243,78 @@ HYPERION_TEST("address_space", "an_oversized_anonymous_mapping_is_refused") {
     // must be refused (nullopt -> ENOMEM) rather than driving an unbounded host
     // allocation. Uses a tiny cap so the test never allocates anything large.
     GuestAddressSpace as(/*mmap_base=*/0x7f0000000000ULL, /*heap_base=*/0x200000ULL,
-                         /*heap_capacity=*/1ULL << 20, /*max_map_bytes=*/64 * 1024);
-    HYPERION_CHECK(!as.map_anonymous(1024 * 1024, MemPerm::kRead | MemPerm::kWrite).has_value());
+                         /*heap_capacity=*/1ULL << 20, /*max_map_bytes=*/64ULL * 1024ULL);
+    HYPERION_CHECK(
+        !as.map_anonymous(1024ULL * 1024ULL, MemPerm::kRead | MemPerm::kWrite).has_value());
     // A request at or below the cap still succeeds.
-    HYPERION_CHECK(as.map_anonymous(64 * 1024, MemPerm::kRead | MemPerm::kWrite).has_value());
+    HYPERION_CHECK(as.map_anonymous(64ULL * 1024ULL, MemPerm::kRead | MemPerm::kWrite).has_value());
+}
+
+HYPERION_TEST("address_space", "brk_page_growth_preserves_existing_heap_bytes_and_honours_cap") {
+    // Critical regression: ensure_heap_mapped() previously replaced `heap.bytes`
+    // with a fresh zero-filled std::vector whenever brk crossed into a new page,
+    // silently wiping every byte the guest had already allocated on the heap!
+    GuestAddressSpace as(/*mmap_base=*/0x7f0000000000ULL, /*heap_base=*/0x200000ULL,
+                         /*heap_capacity=*/64ULL * 1024ULL, /*max_map_bytes=*/8ULL * 1024ULL);
+    HYPERION_CHECK_EQ(as.set_brk(0x200900ULL), 0x200900ULL);
+    const std::uint8_t magic[4] = {0x48, 0x59, 0x50, 0x21};
+    HYPERION_CHECK(as.write(0x200010ULL, magic, sizeof(magic)));
+
+    // Grow across a page boundary into page 2: earlier heap data MUST survive!
+    HYPERION_CHECK_EQ(as.set_brk(0x201800ULL), 0x201800ULL);
+    std::uint8_t got[4] = {};
+    HYPERION_CHECK(as.read(0x200010ULL, got, sizeof(got)));
+    HYPERION_CHECK(std::memcmp(got, magic, sizeof(magic)) == 0);
+
+    // Growing past max_map_bytes (8 KiB) must return unchanged brk on failure.
+    HYPERION_CHECK_EQ(as.set_brk(0x203000ULL), 0x201800ULL);
+}
+
+HYPERION_TEST("address_space", "sub_region_mprotect_and_nx_instruction_fetch_enforcement") {
+    GuestAddressSpace as;
+    // Map 2 pages RX with code on page 0 and data on page 1, then mprotect ONLY
+    // page 1 to RW: page 0 MUST remain RX (executable, non-writable) while page 1
+    // becomes RW (non-executable, writable)!
+    const std::uint8_t program[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xF4}; // mov eax, 42 ; hlt
+    const auto base = as.map_anonymous(2 * kPage, MemPerm::kRead | MemPerm::kExec, 0x500000ULL);
+    HYPERION_CHECK(base.has_value());
+    // Populate page 0 before locking permissions via protect.
+    HYPERION_CHECK(as.protect(*base, 2 * kPage, MemPerm::kRead | MemPerm::kWrite));
+    HYPERION_CHECK(as.write(*base, program, sizeof(program)));
+    HYPERION_CHECK(as.write(*base + kPage, program, sizeof(program)));
+    HYPERION_CHECK(as.protect(*base, 2 * kPage, MemPerm::kRead | MemPerm::kExec));
+
+    // Sub-region mprotect on page 1 ONLY -> RW (NX).
+    HYPERION_CHECK(as.protect(*base + kPage, kPage, MemPerm::kRead | MemPerm::kWrite));
+    HYPERION_CHECK(as.perm_at(*base) == (MemPerm::kRead | MemPerm::kExec));
+    HYPERION_CHECK(as.perm_at(*base + kPage) == (MemPerm::kRead | MemPerm::kWrite));
+
+    // Executing from executable page 0 succeeds in Tier 0 (and Tier 1 on AArch64).
+    hyperion::GuestState ok_state;
+    ok_state.rip = *base;
+    const auto ok0 = hyperion::run_program(as, ok_state);
+    HYPERION_CHECK(ok0.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(ok0.state.reg(hyperion::Gpr::kRax), 42ULL);
+
+    // Executing from NX page 1 MUST FAULT in Tier 0!
+    hyperion::GuestState nx_state;
+    nx_state.rip = *base + kPage;
+    const auto nx0 = hyperion::run_program(as, nx_state);
+    HYPERION_CHECK(nx0.status == hyperion::RunStatus::kFault);
+
+    if (hyperion::ExecMem::executable_supported()) {
+        hyperion::TranslationCache cache;
+        const auto ok1 = cache.run(as, ok_state);
+        HYPERION_CHECK(ok1.status == hyperion::RunStatus::kOk);
+        HYPERION_CHECK_EQ(ok1.state.reg(hyperion::Gpr::kRax), 42ULL);
+
+        const auto nx1 = cache.run(as, nx_state);
+        HYPERION_CHECK(nx1.status == hyperion::RunStatus::kFault);
+
+        // Even when page 0 WAS ALREADY CACHED in Tier 1, dropping PROT_EXEC via
+        // protect() bumps code_epoch() and invalidates the stale translation!
+        HYPERION_CHECK(as.protect(*base, kPage, MemPerm::kRead));
+        const auto revoked = cache.run(as, ok_state);
+        HYPERION_CHECK(revoked.status == hyperion::RunStatus::kFault);
+    }
 }

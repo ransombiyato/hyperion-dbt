@@ -386,3 +386,22 @@ HYPERION_TEST("interpreter", "ret_at_top_level_halts_without_touching_the_stack"
     HYPERION_CHECK_EQ(state.rip, kBase); // halted at the ret, not advanced
     HYPERION_CHECK_EQ(state.reg(Gpr::kRsp), rsp_before);
 }
+
+HYPERION_TEST("interpreter", "pop_rsp_sets_rsp_to_popped_value_not_old_rsp_plus_8") {
+    // Regression: on x86-64 hardware, `pop %rsp` (0x5C) reads [old_rsp],
+    // increments rsp by 8, and THEN writes the loaded value into rsp — so rsp
+    // becomes [old_rsp], never old_rsp + 8.
+    FlatMemory memory(kBase, 4096);
+    memory.data()[0] = 0x5C; // pop rsp
+    memory.data()[1] = 0xF4; // hlt
+    const std::uint64_t old_rsp = kBase + 0x800;
+    const std::uint64_t target_rsp = 0x1122334455667788ULL;
+    std::memcpy(memory.data() + 0x800, &target_rsp, sizeof(target_rsp));
+
+    GuestState state;
+    state.rip = kBase;
+    state.reg(Gpr::kRsp) = old_rsp;
+    const auto r = hyperion::run_program(memory, state, 16);
+    HYPERION_CHECK(r.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(r.state.reg(Gpr::kRsp), target_rsp);
+}

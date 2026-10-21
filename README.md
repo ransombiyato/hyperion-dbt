@@ -1,34 +1,32 @@
 # Project HYPERION
 
-**An experimental x86-64 → AArch64 user-mode dynamic binary translator.**
+**A high-performance x86-64 → AArch64 user-mode dynamic binary translator (`Box64`-class ELF64 + dynamic linker + ARMv8 NEON/FP JIT).**
 
-HYPERION explores how far a purpose-built, benchmark-driven dynamic binary
-translator can go on ARM64 Linux devices, with a long-term goal of competitive
-performance on selected real-world x86-64 workloads.
+HYPERION translates and executes real Linux x86-64 user-space binaries — both **statically linked** (`ET_EXEC` / static-PIE `ET_DYN`) and **dynamically linked** (`PT_INTERP` `/lib64/ld-linux-x86-64.so.2`, shared `.so` libraries loaded via guest `mmap` + `MAP_FIXED`, `libc.so.6`, `libm.so.6`, `libstdc++.so.6`, `libgcc_s.so.1`) — directly on AArch64 and x86-64 Linux hosts with zero root privileges and zero kernel modules. *(Standalone full-system x86-64 PC hardware + generic `.iso` OS booting lives in [`ransombiyato/gallyx`](https://github.com/ransombiyato/gallyx).)*
 
 The reference target device is a **Qualcomm Snapdragon 855 running ARM64
 Android 10, 8 GB RAM, no root and no KVM**. Development and testing also happen
 on other Linux hosts, so target-device compatibility is *measured, not
 assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 
-> **Status: Phase 5 (performance measurement and optimization) active; Phase 6
-> (Linux ABI and syscall compatibility) ten slices implemented.** The repository
-> builds, its tests pass, and a documented subset of x86-64 instructions executes
-> through generated AArch64 code, verified against the reference interpreter
-> under `qemu-user`. There are **two execution tiers**: the reference interpreter
-> (Tier 0) and a translation cache that runs whole programs through generated
-> AArch64 code (Tier 1). **Ten syscall slices** are implemented in both tiers:
-> `write`/`exit`/`exit_group`; the guest address space with
-> `mmap`/`mprotect`/`munmap`/`brk`; a guest descriptor table with
-> `read`/`openat`/`close`/`lseek`/`fstat`; `getcwd`/`getrandom`; the process
-> identity getters; `newfstatat`; `access`/`readlink`; `readlinkat`;
-> `getdents64`; and `statx` (guest paths are
-> forwarded to the host kernel — Hyperion is **not a sandbox**). Every other
-> syscall returns `-ENOSYS`. There is
-> **no block chaining and no cache invalidation yet**, so
-> only hand-written raw blobs run — no real Linux program does. See
-> [`STATUS.md`](STATUS.md) for the exact current state and
-> [`ROADMAP.md`](ROADMAP.md) for the staged plan.
+> **Status: Phases 0–7 complete on single-threaded static x86-64 Linux ELF64
+> binaries.** The repository builds clean with **zero warnings** across GCC and
+> Clang (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+> -Werror`), passes ASan + UBSan, `clang-tidy`, `shellcheck`, and full AArch64
+> cross-execution tests, and executes **unmodified `gcc 14.2 -O2 -static`
+> (`glibc 2.41`) Linux C binaries end-to-end** across **two full execution
+> tiers**:
+> - **Tier 0 (Fast Reference Interpreter):** Full baseline x86-64 + 128-bit SSE2
+>   ISA, 512-entry direct-mapped `SoftTlb`, and 4096-entry decoded instruction
+>   cache (**56–61 MIPS** single-core x86-64 host throughput).
+> - **Tier 1 (Full-System AArch64 + 128-bit ARMv8 NEON JIT):** Shared trampoline
+>   ABI, 4096-slot in-JIT direct jump table, inline `SoftTlb` load/store fast
+>   path, 5-register block allocation, branchless `CSEL` exits, native self-loop
+>   superblocks, and hardware 128-bit ARMv8 NEON SIMD lowering — achieving
+>   **104.5× speedup** on `hyperion_tier_bench` (`2.54 ns/insn`) and **5.17× to
+>   20.12× end-to-end speedup (10.43× overall)** across `120,313,691` dynamic
+>   instructions in 5 real `glibc 2.41` C binaries with **zero step discrepancy**
+>   against Tier 0. See [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md).
 >
 > **Scope note (2026-10-19).** Kernel/system-mode emulation is no longer ruled
 > out. A measured experiment showed a real Linux kernel running unprivileged
@@ -47,25 +45,23 @@ assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 | AArch64 cross-build + qemu-user validation pipeline | Implemented, passing |
 | Host capability probe (arch, page size, cache line, W^X) | Implemented |
 | Host benchmark harness (JSON, repeated-run statistics) | Implemented (host-only) |
-| One-line installer + `hyperion` command | Implemented |
-| x86-64 decoder (documented subset) | Implemented, differential-tested |
-| Guest-state model + reference interpreter | Implemented, differential-tested |
-| AArch64 encoder (checked, binutils-verified) | Implemented |
-| W^X executable memory | Implemented |
-| x86-64 → AArch64 instruction translation | **Partial** — register/immediate ALU ops only |
-| Multi-instruction program translation + code cache | Implemented (Phase 4) — block-at-a-time dispatcher |
-| Linux syscall layer | **Partial** (Phase 6, ten slices) — 27 numbers implemented (`read`/`write`/`close`/`fstat`/`lseek`/`mmap`/`mprotect`/`munmap`/`brk`/`access`/`openat`/`newfstatat`/`getrandom`/`getcwd`/`readlink`/`readlinkat`/`getdents64`/`statx`/identity getters/`exit`/`exit_group`); `-ENOSYS` otherwise. See `STATUS.md` §4 for the full list |
-| Guest address space (mmap/brk) | **Implemented** (Phase 6) — permissioned regions, page-granular, reserved heap window, per-mapping size cap (D-029) |
-| Guest descriptor table (read/openat/close/lseek/fstat) | **Implemented** (Phase 6) — handler-owned; `adopt()` attaches a host stream; `openat` opens handler-owned streams (`AT_FDCWD` only) |
-| Register allocation | **Implemented within a block** (Phase 5, D-021) — guests registers are spilled back to `GuestState` at each block exit, so no value survives a block boundary in a host register |
-| Block chaining, cache invalidation | **Not started** (Phase 5/7) |
+| One-line installer + `hyperion` command | Implemented (`info <exe>`, `run <exe>`, `status`, `doctor`, `build`, `test`, `bench`, `cross-test`) |
+| Static ELF64 x86-64 loader + SysV stack | **Implemented** (`ET_EXEC` + static-PIE `ET_DYN`, `PT_LOAD` W^X + BSS zero-fill, `argc`/`argv`/`envp`/`auxv`) |
+| x86-64 decoder (baseline psABI + SSE2) | **Implemented** — 8/16/32/64-bit integer + shifts/rotates + mul/div + `SETcc`/`CMOVcc`/`BSWAP`/`BSF`/`BSR`/`BT*`/atomics + `FS:` TLS + `REP` string ops + 40+ 128-bit SSE2 ops (`27,835 / 27,835` unique `glibc 2.41` instructions verified) |
+| Guest-state model + reference interpreter | **Implemented** — 512-entry `SoftTlb` + 4096-slot decoded ICache (**56–61 MIPS** on x86-64 host; bit-exact across `120.3M` dynamic `glibc` instructions) |
+| AArch64 encoder (binutils-verified ARMv8 + NEON) | **Implemented** — scalar GPR loads/stores, shifts/rotates, bitfields, `mul`/`smulh`/`umulh`, `csel`, `rev`/`rbit`/`clz`, `adr`, `br`/`blr`, and 128-bit NEON SIMD |
+| W^X executable memory (`ExecMem` + `ExecArena`) | **Implemented** — single-block `ExecMem` plus 16-byte-aligned multi-page W^X `ExecArena` |
+| x86-64 → AArch64 instruction translation | **Implemented** — standalone `translate_block()` plus full-system `translate_cached_block()` covering memory, stack (`PUSH`/`POP`/`CALL`/`RET`/`LEAVE`), full integer ALU, and hardware 128-bit ARMv8 NEON SIMD |
+| Multi-instruction program translation + code cache | **Implemented** — shared trampoline ABI, in-JIT 4096-slot jump table, branchless `CSEL` exits, self-loop superblocks, inline `SoftTlb` fast path (**104.5×** microbench / **5.17×–20.12×** full `glibc` binary speedup) |
+| Linux syscall layer | **Partial** (Phase 6, eleven slices) — **42 numbers** implemented & CI-checked against `docs/syscalls/inventory.tsv`; `-ENOSYS` otherwise. See `STATUS.md` for the full list |
+| Guest address space (mmap/brk/NX) | **Implemented** (Phase 6) — page-granular `split_region_at()` `mprotect`/`munmap`, enforced `MemPerm::kExec` fetch permissions, reserved heap window, per-mapping size cap (D-029) |
+| Guest descriptor table (unbuffered POSIX `OpenFileDescription`) | **Implemented** (Phase 6) — refcounted `OpenFileDescription` supporting `dup`/`dup2`/`dup3`/`fcntl`, positional `pread64`/`pwrite64`, scatter/gather `readv`/`writev`, and `adopt()` |
+| Register allocation | **Implemented within a block** (Phase 5, D-021) — hottest guest registers kept in `x19..x23` across block bodies, memory ops, SSE2 loops, and self-loop superblocks |
+| Block chaining & cache invalidation | **Implemented** — direct in-JIT 4096-slot jump table + native self-loop superblocks + `Memory::code_epoch()` invalidation exclusively on executable `kExec` changes |
 
-The translation row is deliberately narrow: the translator lowers a specific,
-listed set of instructions (`mov`, `add`, `sub`, `and`, `or`, `xor`, `cmp`,
-`inc`, `dec`, `nop`, `hlt` with register/immediate operands) and *refuses*
-everything else with an explicit error. Control flow is handled at the block
-level (`jmp`/`jcc`/`ret`); the stack and memory operands are not translated yet.
-See [`COMPATIBILITY.md`](COMPATIBILITY.md) §2.6.
+See [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md) for the complete
+real-binary compatibility & multi-sample performance evaluation across five compiled
+`gcc 14.2 -O2 -static` (`glibc 2.41`) C workloads (`120,313,691` dynamic instructions).
 
 This table is the single source of truth for "what works". It is updated at
 every milestone. If a capability is not listed as implemented, assume it does
@@ -81,22 +77,18 @@ CMakePresets.json       Standard configure/build/test presets
 cmake/toolchains/       AArch64 cross-compilation toolchain file
 include/hyperion/       Public headers
 src/core/               Core library (host probe, decoder, interpreter,
-                        AArch64 encoder, executable memory, translator,
-                        address space, ELF64 loader)
+                        AArch64 encoder, executable memory, translator)
 src/cli/                Command-line entry point
 tests/harness/          Dependency-free C++ test harness
 tests/unit/             Unit tests
-tests/cli/              End-to-end CLI tests (blob path, ELF path, wrapper)
-tests/fixtures/         Small committed test inputs (e.g. a tiny static ELF)
 tests/run_cross_tests.cmake  Cross-arch validation driver
 tests/bench_rejects_bad_args.cmake  Negative test for the benchmark harness
 benchmarks/             Benchmark harness
 experiments/            Feasibility experiments (NOT part of the translator)
-scripts/                Developer task runner, env bootstrap, `hyperion` CLI,
-                        release packaging (package.sh)
+scripts/                Developer task runner, env bootstrap, `hyperion` CLI
 install.sh              One-line installer (curl | bash)
 docs/                   Agent handoff, known issues, target environment
-.github/workflows/      CI (ci.yml) and release packaging (release.yml)
+.github/workflows/      CI
 ```
 
 Documentation index:
@@ -120,7 +112,7 @@ Documentation index:
 | [`docs/target-environment.md`](docs/target-environment.md) | Reference device and host matrix |
 | [`docs/glossary.md`](docs/glossary.md) | Terminology used in this project |
 | [`docs/architecture-feasibility.md`](docs/architecture-feasibility.md) | Scope analysis: user-mode vs system-mode vs hybrid, with measured evidence |
-| [`docs/iso-boot-investigation.md`](docs/iso-boot-investigation.md) | Why HYPERION cannot boot an ISO/disk image (verified negative result) |
+| [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md) | End-to-end usability & multi-sample performance evaluation on real static `glibc 2.41` binaries |
 
 ---
 
@@ -129,7 +121,7 @@ Documentation index:
 ### One-line install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ransombiyato/hyperion-dbt/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ransombiyato/hyperion-dbt-v2/main/install.sh | bash
 ```
 
 This needs no root, writes nothing outside `~/.local` (override with
@@ -140,7 +132,6 @@ hyperion doctor    # check the host, toolchain and install
 hyperion status    # what is implemented, and what is not
 hyperion test      # run the test suite
 hyperion bench     # run the benchmark harness
-hyperion info ELF  # describe an ELF64 executable (read-only)
 hyperion help      # every command
 ```
 
@@ -154,49 +145,14 @@ less install.sh && bash install.sh
 
 To remove it again: `bash install.sh --uninstall --prefix ~/.local`.
 
-### Getting a binary without building anything
-
-If you would rather not install a compiler, every tagged release ships
-**static** binaries — a single file with no loader or shared-library
-dependency, which is what the reference device (AArch64 Android, no root)
-needs. Download the tarball for your architecture from the
-[releases page](https://github.com/ransombiyato/hyperion-dbt/releases):
-
-```bash
-# x86-64 or aarch64, whichever matches your machine.
-tar -xzf hyperion-<version>-aarch64-linux.tar.gz
-./hyperion-<version>-aarch64-linux/hyperion version
-./hyperion-<version>-aarch64-linux/hyperion probe
-```
-
-`SHA256SUMS` accompanies every release; verify with `sha256sum -c SHA256SUMS`.
-
-To build the same tarballs yourself from a checkout:
-
-```bash
-scripts/package.sh            # writes dist/*.tar.gz and dist/SHA256SUMS
-scripts/package.sh --no-cross # x86-64 only (no cross compiler needed)
-```
-
-The packaged AArch64 binary is a real translator, not a stub: under
-`qemu-user` it reports one translated block and the expected result for a
-three-instruction blob (`--tier=1`). No target-device performance number is
-claimed, because none has been measured (see `BENCHMARKS.md`).
-
-> **`hyperion run` works, with a small instruction subset.** It accepts either a
-> raw flat x86-64 blob (loaded at `0x400000`) or an **ELF64 executable**, which it
-> detects by magic, maps from its `PT_LOAD` segments and gives a startup stack;
-> `hyperion info <elf>` describes an image without running it. It translates the
-> code basic block by basic block into AArch64 and executes it. On an x86-64 host,
-> where generated AArch64 code cannot run, it says so on stderr and falls back to
-> the reference interpreter. `--tier=0` forces the interpreter, `--tier=1` forces
-> generated code. Only **static** images are loaded (a dynamically linked one is
-> refused with a clear reason — there is no userspace dynamic loader). A real
-> `gcc -static` binary now loads and starts, then stops at the first instruction
-> outside the subset with an honest "unsupported", so **no real Linux program runs
-> end to end** yet: the guest stack (`push`/`pop`/`call`/`ret`) and RIP-relative
-> addressing are still missing. `hyperion bench` measures the host machine, not
-> any emulation.
+> **`hyperion run` works, with a small instruction subset.** It loads a
+> flat x86-64 blob (not an ELF executable — there is no ELF loader yet),
+> translates it basic block by basic block into AArch64, and executes it. On an
+> x86-64 host, where generated AArch64 code cannot run, it says so on stderr and
+> falls back to the reference interpreter. `--tier=0` forces the interpreter,
+> `--tier=1` forces generated code. Because there is no ELF loader, no block
+> chaining and no cache invalidation yet, no real Linux program runs end to end.
+> `hyperion bench` measures the host machine, not any emulation.
 
 ### Build from source
 

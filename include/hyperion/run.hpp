@@ -19,7 +19,7 @@
 namespace hyperion {
 
 // Result of running a program image to completion.
-enum class RunStatus {
+enum class RunStatus : std::uint8_t {
     kOk,          // program halted (HLT/RET) normally
     kStepLimit,   // max_steps reached without halting
     kFault,       // memory fault during execution
@@ -36,6 +36,8 @@ struct RunResult {
     // the program asked for something Hyperion does not implement yet; it is
     // recorded so an unimplemented call is never invisible.
     std::uint64_t unimplemented_syscalls = 0;
+    bool exited_via_syscall = false;
+    std::int64_t exit_code = 0;
     // The final architectural state, valid when status == kOk or kStepLimit.
     GuestState state;
 };

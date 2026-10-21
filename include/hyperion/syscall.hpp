@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "hyperion/address_space.hpp"
@@ -58,25 +59,56 @@ inline constexpr std::uint64_t kMmap = 9;
 inline constexpr std::uint64_t kMprotect = 10;
 inline constexpr std::uint64_t kMunmap = 11;
 inline constexpr std::uint64_t kBrk = 12;
+inline constexpr std::uint64_t kPread64 = 17;
+inline constexpr std::uint64_t kPwrite64 = 18;
+inline constexpr std::uint64_t kReadv = 19;
+inline constexpr std::uint64_t kWritev = 20;
 inline constexpr std::uint64_t kAccess = 21;
+inline constexpr std::uint64_t kDup = 32;
+inline constexpr std::uint64_t kDup2 = 33;
 inline constexpr std::uint64_t kGetpid = 39;
 inline constexpr std::uint64_t kExit = 60;
+inline constexpr std::uint64_t kUname = 63;
+inline constexpr std::uint64_t kFcntl = 72;
 inline constexpr std::uint64_t kGetcwd = 79;
 inline constexpr std::uint64_t kReadlink = 89;
+inline constexpr std::uint64_t kGettimeofday = 96;
 inline constexpr std::uint64_t kGetuid = 102;
 inline constexpr std::uint64_t kGetgid = 104;
 inline constexpr std::uint64_t kGeteuid = 107;
 inline constexpr std::uint64_t kGetegid = 108;
 inline constexpr std::uint64_t kGetppid = 110;
+inline constexpr std::uint64_t kArchPrctl = 158;
 inline constexpr std::uint64_t kGettid = 186;
 inline constexpr std::uint64_t kGetdents64 = 217;
+inline constexpr std::uint64_t kSetTidAddress = 218;
+inline constexpr std::uint64_t kClockGettime = 228;
 inline constexpr std::uint64_t kExitGroup = 231;
 inline constexpr std::uint64_t kOpenat = 257;
 inline constexpr std::uint64_t kNewfstatat = 262;
 inline constexpr std::uint64_t kReadlinkat = 267;
+inline constexpr std::uint64_t kSetRobustList = 273;
+inline constexpr std::uint64_t kDup3 = 292;
+inline constexpr std::uint64_t kPrlimit64 = 302;
 inline constexpr std::uint64_t kGetrandom = 318;
 inline constexpr std::uint64_t kStatx = 332;
 } // namespace sysno
+
+namespace arch_prctl_code {
+inline constexpr std::uint64_t kSetGs = 0x1001;
+inline constexpr std::uint64_t kSetFs = 0x1002;
+inline constexpr std::uint64_t kGetFs = 0x1003;
+inline constexpr std::uint64_t kGetGs = 0x1004;
+} // namespace arch_prctl_code
+
+namespace fcntl_cmd {
+inline constexpr std::int32_t kDupfd = 0;
+inline constexpr std::int32_t kGetfd = 1;
+inline constexpr std::int32_t kSetfd = 2;
+inline constexpr std::int32_t kGetfl = 3;
+inline constexpr std::int32_t kSetfl = 4;
+inline constexpr std::int32_t kDupfdCloexec = 1030;
+} // namespace fcntl_cmd
 
 // openat(2) flags (the subset this increment maps to the host). The values match
 // the x86-64 Linux ABI; a guest passing them gets the kernel's interpretation.
@@ -211,7 +243,7 @@ inline constexpr std::int64_t kErange = 34;
 inline constexpr std::int64_t kEintr = 4;
 
 // What the handler did with a syscall.
-enum class SyscallStatus {
+enum class SyscallStatus : std::uint8_t {
     kHandled,       // emulated: rax holds the result (or a negative errno)
     kUnimplemented, // not implemented: rax = -ENOSYS, execution continues
     kExit,          // the guest asked to terminate
@@ -234,12 +266,31 @@ public:
     virtual SyscallResult handle(GuestState& state, Memory& memory) = 0;
 };
 
-// A guest descriptor table entry. `owned` distinguishes a stream the handler
-// opened (and closes on close) from one the embedder adopted (whose owner closes
-// it). Defined here because the table is a member of MinimalSyscallHandler.
-struct GuestDescriptor {
+// Shared POSIX open file description (shared across dup/dup2/dup3/fcntl F_DUPFD).
+// Regular files opened via openat(2) store an unbuffered kernel `host_fd` so
+// read/write/lseek/pread/pwrite/fstat/getdents64 never suffer C stdio buffer
+// desynchronisation; adopted `std::FILE*` streams (such as in-memory test
+// streams) keep `stream` and borrow ownership from the caller.
+struct OpenFileDescription {
+    int host_fd = -1;
+    bool owned_fd = false;
+    int sink_fd = -1; // 1 or 2 when routed through OutputSink
     std::FILE* stream = nullptr;
-    bool owned = false;
+    int status_flags = 0;
+
+    ~OpenFileDescription();
+    OpenFileDescription() = default;
+    OpenFileDescription(const OpenFileDescription&) = delete;
+    OpenFileDescription& operator=(const OpenFileDescription&) = delete;
+};
+
+// Per-descriptor slot in the guest process's file descriptor table. `cloexec`
+// is per-FD (FD_CLOEXEC), whereas file offset and status flags live on `desc`.
+struct GuestDescriptor {
+    std::shared_ptr<OpenFileDescription> desc;
+    bool cloexec = false;
+
+    bool is_open() const noexcept { return desc != nullptr; }
 };
 
 // A handler for the minimum needed to run a self-contained guest program that
@@ -286,12 +337,23 @@ public:
     // boundary. Fails (false) if the fd is already taken or out of range.
     bool adopt(int guest_fd, std::FILE* stream);
 
+    // Enable full Box64-style Linux user-space compatibility (`mmap` file-backed
+    // shared libraries + `MAP_FIXED`, directory-relative `*at(dirfd, ...)` calls,
+    // `ioctl(TCGETS/TIOCGWINSZ)`, `open`/`stat`/`lstat`/`pipe2`/`futex`/signals/
+    // `sched_getaffinity`/`sysinfo`/`prctl`, and optional `--sysroot` prefixing).
+    void enable_linux_compat(std::string sysroot = {});
+
 private:
     OutputSink sink_;
     GuestAddressSpace* address_space_;
     // Guest fd -> descriptor. Indexed by guest fd, so the guest can never index
     // out of range (the lookup is bounds-checked).
     std::vector<GuestDescriptor> files_;
+    std::uint64_t clear_child_tid_ = 0;
+    std::uint64_t robust_list_head_ = 0;
+    bool linux_compat_ = false;
+    std::string sysroot_;
+    std::uint64_t sigmask_ = 0;
 };
 
 // True if MinimalSyscallHandler implements this syscall number (as opposed to

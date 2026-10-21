@@ -40,40 +40,48 @@ here is rejected with a specific `DecodeError` — the decoder never guesses.
 
 | Instruction | Encodings accepted | Operand sizes | Notes |
 | --- | --- | --- | --- |
-| `mov r, r/m` | `0x8B` | 32, 64 | reg ← reg/mem |
-| `mov r/m, r` | `0x89` | 32, 64 | reg/mem ← reg |
+| `mov r, r/m` | `0x8B` | 32, 64 | reg ← reg/mem (incl. `[rip + disp32]`) |
+| `mov r/m, r` | `0x89` | 32, 64 | reg/mem ← reg (incl. `[rip + disp32]`) |
 | `mov r, imm` | `0xB8+rd` | 32, 64 | 32-bit imm; 64-bit form reads 8-byte imm |
-| `add` | `0x01`, `0x03`, `0x81/0`, `0x83/0` | 32, 64 | r/m,r · r,r/m · imm32 · imm8(sx) |
-| `or` | `0x09`, `0x0B`, `0x81/1`, `0x83/1` | 32, 64 | as above |
-| `and` | `0x21`, `0x23`, `0x81/4`, `0x83/4` | 32, 64 | as above |
-| `sub` | `0x29`, `0x2B`, `0x81/5`, `0x83/5` | 32, 64 | as above |
-| `xor` | `0x31`, `0x33`, `0x81/6`, `0x83/6` | 32, 64 | as above |
-| `cmp` | `0x39`, `0x3B`, `0x81/7`, `0x83/7` | 32, 64 | flags only; no write-back |
+| `lea r, m` | `0x8D` | 32, 64 | `[rip + disp32]` & full SIB; `mod=11` rejected; Tier 0 & Tier 1 |
+| `add` | `0x01`, `0x03`, `0x05`, `0x81/0`, `0x83/0` | 32, 64 | r/m,r · r,r/m · eax/rax,imm32 · imm32 · imm8(sx) |
+| `or` | `0x09`, `0x0B`, `0x0D`, `0x81/1`, `0x83/1` | 32, 64 | as above |
+| `and` | `0x21`, `0x23`, `0x25`, `0x81/4`, `0x83/4` | 32, 64 | as above |
+| `sub` | `0x29`, `0x2B`, `0x2D`, `0x81/5`, `0x83/5` | 32, 64 | as above |
+| `xor` | `0x31`, `0x33`, `0x35`, `0x81/6`, `0x83/6` | 32, 64 | as above |
+| `cmp` | `0x39`, `0x3B`, `0x3D`, `0x81/7`, `0x83/7` | 32, 64 | flags only; no write-back |
+| `test` | `0x85`, `0xA9`, `0xF7/0` | 32, 64 | r/m,r · eax/rax,imm32 · r/m,imm32; Tier 0 & Tier 1 |
 | `inc` | `0xFF/0` | 32, 64 | preserves CF |
 | `dec` | `0xFF/1` | 32, 64 | preserves CF |
 | `push r64` | `0x50+rd` | 64 | `rsp -= 8; [rsp] = r` |
-| `pop r64` | `0x58+rd` | 64 | `r = [rsp]; rsp += 8` |
+| `pop r64` | `0x58+rd` | 64 | `val = [rsp]; rsp += 8; r = val` (`pop rsp` sets popped value) |
 | `jmp rel32` | `0xE9` | — | absolute target = next rip + rel32 |
 | `jmp rel8` | `0xEB` | — | short form; absolute target = next rip + rel8 |
-| `jcc rel8` | `0x70..0x7F` | — | all 16 conditions; **short form only** |
-| `nop` | `0x90` | — | |
+| `jcc rel8` | `0x70..0x7F` | — | all 16 conditions (short form) |
+| `jcc rel32` | `0x0F 0x80..0x8F` | — | all 16 conditions (near form); Tier 0 & Tier 1 |
+| `syscall` | `0x0F 0x05` | — | 42 Linux syscalls handled; `-ENOSYS` otherwise |
+| `nop` | `0x90` | — | benign REX (`REX.B == 0`) accepted; `REX.B == 1` (`xchg r8, rax`) rejected |
 | `hlt` | `0xF4` | — | stops execution (see §2.4) |
 | `ret` | `0xC3` | — | modelled as "stop" (see §2.4) |
 
-For the `0x81`/`0x83` immediate forms with a 64-bit operand, the immediate is
-**sign-extended** to 64 bits (`imm32`→64, `imm8`→64), exactly as x86-64 does.
-`0x80` (8-bit group 1) is rejected.
+For the `0x05..0x3D`, `0x81`/`0x83`, `0xA9`, and `0xF7/0` immediate forms with
+a 64-bit operand, the immediate is **sign-extended** to 64 bits (`imm32`→64,
+`imm8`→64), exactly as x86-64 does. Instructions exceeding 15 bytes return
+`DecodeError::kTooLong`. `0x80` (8-bit group 1) is rejected.
 
 ### 2.2 Addressing forms
 
-`ModRM` mod=00/01/10 with rm≠100 (no SIB) and rm=100 (SIB) are supported:
+`ModRM` mod=00/01/10 with rm≠100 (no SIB), rm=101/mod=00 (`[rip + disp32]`), and
+rm=100 (SIB, including `mod=00, base=101` `[disp32]` / `[index*scale + disp32]`)
+are all supported:
 
-- `[disp32]`, `[base]`, `[base + disp8]`, `[base + disp32]`
+- `[rip + disp32]` (resolved against `insn.address + insn.length + disp32`; `REX.B` ignored per Intel SDM Vol. 2A Table 2-7)
+- `[disp32]`, `[index*scale + disp32]` (`SIB mod=00, base=101`)
+- `[base]`, `[base + disp8]`, `[base + disp32]`
 - `[base + index*scale + disp8/disp32]` with scale ∈ {1, 2, 4, 8}
 - REX.R/REX.X/REX.B extend the reg/index/base fields to r8–r15.
 
-**Not supported (rejected):** RIP-relative addressing (mod=00, rm=101) and the
-8-bit (`0x88`/`0x8A`) forms.
+**Not supported (rejected):** 32-bit address-size override (`0x67`) and 8-bit (`0x88`/`0x8A`) forms.
 
 ### 2.3 Rejection behaviour (`DecodeError`)
 

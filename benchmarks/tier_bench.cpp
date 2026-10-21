@@ -179,9 +179,10 @@ bool check_loop(const GuestState& s, std::uint64_t iterations) {
     return s.reg(Gpr::kRdx) == iterations;
 }
 
-bool check_wide(const GuestState& s, std::uint64_t) {
-    // All sources are zero, so rax accumulates 0; r12 counts down to 0.
-    return s.reg(Gpr::kRax) == 0 && s.reg(Gpr::kR12) == 0;
+bool check_wide(const GuestState& s, std::uint64_t iterations) {
+    // Seeds rbx=1..r11=9 plus a second `add rax, rbx` add 46 per loop iteration,
+    // catching any register-allocator slot aliasing or spill/reload mismatch.
+    return s.reg(Gpr::kRax) == 46ULL * iterations && s.reg(Gpr::kR12) == 0;
 }
 
 Workload make_workload(bool wide, std::uint64_t iterations) {
@@ -191,6 +192,15 @@ Workload make_workload(bool wide, std::uint64_t iterations) {
     if (wide) {
         w.name = "wide hot block: 11 guest registers, 12-instruction loop body";
         w.program = make_wide_program(static_cast<std::uint32_t>(iterations));
+        w.initial.reg(Gpr::kRbx) = 1;
+        w.initial.reg(Gpr::kRcx) = 2;
+        w.initial.reg(Gpr::kRdx) = 3;
+        w.initial.reg(Gpr::kRsi) = 4;
+        w.initial.reg(Gpr::kRdi) = 5;
+        w.initial.reg(Gpr::kR8) = 6;
+        w.initial.reg(Gpr::kR9) = 7;
+        w.initial.reg(Gpr::kR10) = 8;
+        w.initial.reg(Gpr::kR11) = 9;
         w.steps_per_iteration = 13; // 12 loop-body insns + the final hlt amortised
         w.check = check_wide;
     } else {
@@ -287,7 +297,7 @@ int main(int argc, char** argv) {
         std::memcpy(mem.data(), workload.program.data(), workload.program.size());
         const GuestState st = workload.initial;
         hyperion::TranslationCache cache;
-        cache.run(mem, st);
+        cache.run(mem, st, workload.steps_per_iteration * workload.iterations);
         tier1_code_bytes = cache.total_code_bytes();
         tier1_block_count = cache.block_count();
         tier1_dispatch_hits = cache.dispatch_hits();
@@ -340,11 +350,11 @@ int main(int argc, char** argv) {
             std::printf("    \"reason\": \"%s\"\n", tier1_reason.c_str());
         }
         std::printf("  },\n");
-        std::printf("  \"notes\": \"Tier 1 has register allocation within a block (4.2.6) but no "
-                    "block chaining yet. On a "
-                    "host that can execute AArch64 directly these numbers reflect that; under "
-                    "qemu-user both tiers are additionally translated by qemu, so the ratio is a "
-                    "relative sanity signal, not a hardware performance claim.\"\n");
+        std::printf(
+            "  \"notes\": \"Tier 1 includes block register allocation, hardware NZCV "
+            "branch fusion, native self-loop superblocks, ExecArena code caching, and "
+            "2-way block chaining. Under qemu-user both tiers are additionally translated "
+            "by qemu, so the ratio is a relative sanity signal rather than silicon timing.\"\n");
         std::printf("}\n");
     } else {
         std::printf("hyperion tier 0 vs tier 1 benchmark\n");

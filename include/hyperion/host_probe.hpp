@@ -16,7 +16,7 @@
 namespace hyperion {
 
 // Architectures the probe can positively identify.
-enum class HostArch {
+enum class HostArch : std::uint8_t {
     kUnknown,
     kX86_64,
     kAarch64,

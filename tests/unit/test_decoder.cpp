@@ -143,11 +143,15 @@ HYPERION_TEST("decoder", "jcc_negative_rel8_is_signed") {
 }
 
 HYPERION_TEST("decoder", "rejects_unsupported_prefix") {
-    // 0x66 is the operand-size prefix. Ignoring it would decode a 16-bit
-    // instruction as 32-bit, which is silently wrong.
-    const auto r = dec({0x66, 0x89, 0xD8});
+    // 0x65 (GS:) and legacy segment prefixes remain unsupported, while 0x66
+    // properly decodes as 16-bit operand size.
+    const auto r = dec({0x65, 0x89, 0xD8});
     HYPERION_CHECK(!r.ok());
     HYPERION_CHECK(r.error == DecodeError::kUnsupportedPrefix);
+
+    const auto r16 = dec({0x66, 0x89, 0xD8});
+    HYPERION_CHECK(r16.ok());
+    HYPERION_CHECK(r16.instruction.dst.size == hyperion::OperandSize::k16);
 }
 
 HYPERION_TEST("decoder", "rejects_lock_prefix") {
@@ -156,11 +160,51 @@ HYPERION_TEST("decoder", "rejects_lock_prefix") {
     HYPERION_CHECK(r.error == DecodeError::kUnsupportedPrefix);
 }
 
-HYPERION_TEST("decoder", "rejects_rip_relative") {
-    // 48 8B 05 <disp32> = mov rax, [rip+disp] — common, but not modelled yet.
-    const auto r = dec({0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00});
-    HYPERION_CHECK(!r.ok());
-    HYPERION_CHECK(r.error == DecodeError::kUnsupportedModrm);
+HYPERION_TEST("decoder", "decodes_rip_relative_and_lea_and_test_and_near_jcc") {
+    // 48 8B 05 10 00 00 00 = mov rax, [rip + 0x10]
+    const auto mov_rip = dec({0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00});
+    HYPERION_CHECK(mov_rip.ok());
+    HYPERION_CHECK(mov_rip.instruction.opcode == Opcode::kMov);
+    HYPERION_CHECK(mov_rip.instruction.src.kind == OperandKind::kMemory);
+    HYPERION_CHECK(mov_rip.instruction.src.mem.rip_relative);
+    HYPERION_CHECK(!mov_rip.instruction.src.mem.has_base);
+    HYPERION_CHECK_EQ(mov_rip.instruction.src.mem.disp, std::int64_t{0x10});
+
+    // REX.B (0x49) is ignored for mod=00, rm=101 per Intel SDM Vol. 2A Table 2-7.
+    const auto rexb_rip = dec({0x49, 0x8B, 0x05, 0xF8, 0xFF, 0xFF, 0xFF});
+    HYPERION_CHECK(rexb_rip.ok());
+    HYPERION_CHECK(rexb_rip.instruction.src.mem.rip_relative);
+    HYPERION_CHECK_EQ(rexb_rip.instruction.src.mem.disp, std::int64_t{-8});
+
+    // 48 8D 35 20 00 00 00 = lea rsi, [rip + 0x20]
+    const auto lea_rip = dec({0x48, 0x8D, 0x35, 0x20, 0x00, 0x00, 0x00});
+    HYPERION_CHECK(lea_rip.ok());
+    HYPERION_CHECK(lea_rip.instruction.opcode == Opcode::kLea);
+    HYPERION_CHECK(lea_rip.instruction.dst.reg == Gpr::kRsi);
+    HYPERION_CHECK(lea_rip.instruction.src.mem.rip_relative);
+    HYPERION_CHECK_EQ(lea_rip.instruction.src.mem.disp, std::int64_t{0x20});
+
+    // LEA with mod == 3 (register source) raises #UD on x86-64.
+    const auto lea_reg = dec({0x48, 0x8D, 0xC3});
+    HYPERION_CHECK(!lea_reg.ok());
+    HYPERION_CHECK(lea_reg.error == DecodeError::kUnsupportedModrm);
+
+    // 48 85 C0 = test rax, rax; F7 C1 78 56 34 12 = test ecx, 0x12345678
+    const auto test_rr = dec({0x48, 0x85, 0xC0});
+    HYPERION_CHECK(test_rr.ok());
+    HYPERION_CHECK(test_rr.instruction.opcode == Opcode::kTest);
+    const auto test_imm = dec({0xF7, 0xC1, 0x78, 0x56, 0x34, 0x12});
+    HYPERION_CHECK(test_imm.ok());
+    HYPERION_CHECK(test_imm.instruction.opcode == Opcode::kTest);
+    HYPERION_CHECK_EQ(test_imm.instruction.src.imm, 0x12345678ULL);
+
+    // 0F 85 80 01 00 00 = jne rel32 (+0x180 from end of 6-byte insn)
+    const auto jcc_near = dec({0x0F, 0x85, 0x80, 0x01, 0x00, 0x00});
+    HYPERION_CHECK(jcc_near.ok());
+    HYPERION_CHECK(jcc_near.instruction.opcode == Opcode::kJcc);
+    HYPERION_CHECK(jcc_near.instruction.condition == hyperion::Condition::kNe);
+    HYPERION_CHECK_EQ(jcc_near.instruction.length, std::uint8_t{6});
+    HYPERION_CHECK_EQ(jcc_near.instruction.dst.imm, 0x1000ULL + 6 + 0x180);
 }
 
 HYPERION_TEST("decoder", "rejects_unknown_opcode") {
@@ -199,15 +243,81 @@ HYPERION_TEST("decoder", "rejects_empty") {
     HYPERION_CHECK(r.error == DecodeError::kTruncated);
 }
 
-HYPERION_TEST("decoder", "rejects_adc_sbb_group") {
-    // 48 81 D0 <imm32> = adc rax, imm — group 1 extension 2, not modelled.
+HYPERION_TEST("decoder", "decodes_adc_sbb_group") {
+    // 48 81 D0 <imm32> = adc rax, 1 — group 1 extension 2.
     const auto r = dec({0x48, 0x81, 0xD0, 0x01, 0x00, 0x00, 0x00});
-    HYPERION_CHECK(!r.ok());
-    HYPERION_CHECK(r.error == DecodeError::kUnknownOpcode);
+    HYPERION_CHECK(r.ok());
+    HYPERION_CHECK(r.instruction.opcode == Opcode::kAdc);
+    HYPERION_CHECK_EQ(r.instruction.src.imm, 1ULL);
 }
 
 HYPERION_TEST("decoder", "to_string_is_readable") {
     const auto r = dec({0x48, 0x01, 0xD8}); // add rax, rbx
     HYPERION_CHECK(r.ok());
     HYPERION_CHECK_EQ(hyperion::to_string(r.instruction), std::string("add rax, rbx"));
+}
+
+HYPERION_TEST("decoder", "accumulator_immediate_alu_forms") {
+    // 05 78 56 34 12 = add eax, 0x12345678
+    const auto add32 = dec({0x05, 0x78, 0x56, 0x34, 0x12});
+    HYPERION_CHECK(add32.ok());
+    HYPERION_CHECK(add32.instruction.opcode == Opcode::kAdd);
+    HYPERION_CHECK(add32.instruction.dst.reg == Gpr::kRax);
+    HYPERION_CHECK(add32.instruction.dst.size == hyperion::OperandSize::k32);
+    HYPERION_CHECK_EQ(add32.instruction.src.imm, 0x12345678ULL);
+
+    // 48 3D F0 FF FF FF = cmp rax, -16
+    const auto cmp64 = dec({0x48, 0x3D, 0xF0, 0xFF, 0xFF, 0xFF});
+    HYPERION_CHECK(cmp64.ok());
+    HYPERION_CHECK(cmp64.instruction.opcode == Opcode::kCmp);
+    HYPERION_CHECK(cmp64.instruction.dst.reg == Gpr::kRax);
+    HYPERION_CHECK(cmp64.instruction.dst.size == hyperion::OperandSize::k64);
+    HYPERION_CHECK_EQ(cmp64.instruction.src.imm, static_cast<std::uint64_t>(-16LL));
+}
+
+HYPERION_TEST("decoder", "sib_disp32_without_base") {
+    // 48 8B 04 25 00 10 40 00 = mov rax, [0x401000]
+    const auto abs_mem = dec({0x48, 0x8B, 0x04, 0x25, 0x00, 0x10, 0x40, 0x00});
+    HYPERION_CHECK(abs_mem.ok());
+    HYPERION_CHECK(abs_mem.instruction.src.kind == OperandKind::kMemory);
+    HYPERION_CHECK(!abs_mem.instruction.src.mem.has_base);
+    HYPERION_CHECK(!abs_mem.instruction.src.mem.has_index);
+    HYPERION_CHECK_EQ(abs_mem.instruction.src.mem.disp, 0x401000);
+
+    // 48 8B 04 CD 80 20 40 00 = mov rax, [rcx*8 + 0x402080]
+    const auto scaled = dec({0x48, 0x8B, 0x04, 0xCD, 0x80, 0x20, 0x40, 0x00});
+    HYPERION_CHECK(scaled.ok());
+    HYPERION_CHECK(!scaled.instruction.src.mem.has_base);
+    HYPERION_CHECK(scaled.instruction.src.mem.has_index);
+    HYPERION_CHECK(scaled.instruction.src.mem.index == Gpr::kRcx);
+    HYPERION_CHECK_EQ(scaled.instruction.src.mem.scale, 8u);
+    HYPERION_CHECK_EQ(scaled.instruction.src.mem.disp, 0x402080);
+}
+
+HYPERION_TEST("decoder", "benign_rex_nop_and_multi_rex_length_limit") {
+    // 48 90 = rex.W nop (alignment NOP emitted by toolchains)
+    const auto nop64 = dec({0x48, 0x90});
+    HYPERION_CHECK(nop64.ok());
+    HYPERION_CHECK(nop64.instruction.opcode == Opcode::kNop);
+    HYPERION_CHECK_EQ(nop64.instruction.length, 2u);
+
+    // 41 90 = xchg r8d, eax — NOT a NOP; decodes as 32-bit XCHG r8d, eax.
+    const auto xchg_r8 = dec({0x41, 0x90});
+    HYPERION_CHECK(xchg_r8.ok());
+    HYPERION_CHECK(xchg_r8.instruction.opcode == Opcode::kXchg);
+    HYPERION_CHECK(xchg_r8.instruction.dst.reg == hyperion::Gpr::kR8);
+    HYPERION_CHECK(xchg_r8.instruction.dst.size == hyperion::OperandSize::k32);
+    HYPERION_CHECK(xchg_r8.instruction.src.reg == hyperion::Gpr::kRax);
+
+    // 14 REX bytes + 0x90 = 15 bytes (architectural max): valid NOP.
+    const auto ok15 = dec(
+        {0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x90});
+    HYPERION_CHECK(ok15.ok());
+    HYPERION_CHECK_EQ(ok15.instruction.length, 15u);
+
+    // 15 REX bytes + 0x90 = 16 bytes: exceeds 15-byte x86-64 limit -> kTooLong.
+    const auto too_long = dec({0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+                               0x40, 0x40, 0x40, 0x40, 0x90});
+    HYPERION_CHECK(!too_long.ok());
+    HYPERION_CHECK(too_long.error == DecodeError::kTooLong);
 }

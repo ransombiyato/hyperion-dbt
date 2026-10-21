@@ -5,160 +5,30 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
-## [Unreleased] — ELF64 program-image loader (`hyperion info` / `run <elf>`)
+## [Unreleased] — Full-System Baseline x86-64 + 128-bit SSE2 ISA, ARMv8 + NEON Tier 1 JIT, and Real Static `glibc` Binary Support (`hyperion-dbt-v2`)
 
 ### Added
-- **`include/hyperion/elf.hpp`, `src/core/elf.cpp`** — an ELF64 program-image
-  loader. `parse_elf64()` validates the header and program headers against the
-  file bounds and returns a distinct `ElfError` per rule (bad magic, 32-bit,
-  big-endian, wrong machine, not an executable, truncated header, program-header
-  table past EOF, `p_filesz > p_memsz`, segment bytes past EOF, incongruent
-  `p_vaddr`/`p_offset`, malformed or absent `PT_INTERP`, no `PT_LOAD`). It
-  touches no memory, so it is directly testable on hostile input.
-  `map_elf_image()`/`load_elf64()` map the `PT_LOAD` segments into the guest
-  address space, zero-fill BSS, and build the startup stack (argc/argv/envp/auxv)
-  with `rsp` 16-byte aligned at entry, as the ABI requires. A dynamically linked
-  image (one with `PT_INTERP`) is refused with `ElfError::kNeedsInterpreter`
-  rather than loaded and then failing later.
-- **`GuestAddressSpace::map_segment()`** — maps a loaded segment at an arbitrary
-  (not necessarily page-aligned) `vaddr`: it maps the whole pages the segment
-  touches, places the file bytes at the correct in-page offset, zero-fills the
-  rest, and merges a page shared with an earlier `PT_LOAD` (union of permissions,
-  keeping the earlier bytes).
-- **`hyperion info <elf>`** — read-only description of an image: class, type,
-  entry point, interpreter, per-segment permissions/vaddr/memsz/filesz, image end.
-- **`hyperion run <elf>`** — detects an ELF by magic, maps it, and runs it with
-  the guest syscall layer enabled. A raw blob keeps the previous flat-memory path.
-- **`tests/unit/test_elf.cpp`** — 17 parser/mapper cases plus a bounded,
-  deterministic robustness test (2000 random buffers and byte-mutations of a
-  valid image through parse+map).
-- **`tests/cli/elf_test.sh`** + **`tests/fixtures/tiny-static.elf`** — drives
-  `info`/`run` over a committed hand-built static ELF (both tiers, exactly one
-  retired instruction), and checks that a non-ELF file still takes the blob path
-  and a truncated ELF is rejected with a clear reason.
-
-### Changed
-- `src/cli/main.cpp`: `run` is now ELF-aware; added the `info` command.
-- `include/hyperion/address_space.hpp`: `map_segment` takes a `vaddr` that need
-  not be page-aligned and documents the page-sharing merge.
-- `tests/CMakeLists.txt`: registers `unit/test_elf.cpp` and the `cli.elf` test.
-
-### Notes
-- A real `gcc -static` binary now **loads** (`hyperion info` shows its four
-  `PT_LOAD` segments) and **starts** at its true entry (`0x4015c0`), then stops at
-  `0x4015c9` (`and rsp, -16`) with `status: unsupported`. It does not run real
-  programs yet: the guest stack (`push`/`pop`/`call`/`ret`), RIP-relative
-  addressing and the remaining ALU immediates are the blockers (LIM-020).
+- **Full baseline x86-64 + 128-bit SSE2 ISA (`decoder.{hpp,cpp}`, `guest_state.hpp`, `interpreter.{hpp,cpp}`):** `FS:` TLS addressing, `DF` + `REP`/`REPZ`/`REPNZ` string ops (`MOVS*`/`STOS*`/`CMPS*`/`SCAS*`), 8/16/32/64-bit GPRs incl. `AH`–`DH`, shifts/rotates, 1/2/3-operand & widening `MUL`/`IMUL`, 8–64-bit `DIV`/`IDIV`, sign-extensions, `CMOVcc`, `SETcc`, `BSWAP`, `BSF`/`BSR`/`TZCNT`/`LZCNT`, `BT`/`BTS`/`BTR`/`BTC`, `XCHG`/`CMPXCHG`/`XADD`, `LEAVE`, `CPUID`/`RDTSC`, and 40+ 128-bit SSE2 packed-integer and scalar floating-point instructions (`27,835 / 27,835` unique `glibc 2.41` instructions decoded).
+- **512-entry software MMU `SoftTlb` + 4096-entry decoded ICache:** direct-mapped page addend cache (`56–61 MIPS` native Tier 0 throughput) with executable-only `code_epoch()` invalidation and unconditional syscall data-TLB flush across `brk`/`mmap`/`munmap`/`mprotect`.
+- **Full-system AArch64 + 128-bit ARMv8 NEON Tier 1 JIT (`aarch64_encoder.{hpp,cpp}`, `translator.{hpp,cpp}`, `translation_cache.{hpp,cpp}`):** shared trampoline ABI (`enter_jit`, 4096-slot in-JIT direct jump table, shared budget/exit epilogues), inline 8-instruction `SoftTlb` load/store fast path with out-of-line cold stubs and exact instruction-level fault exits, native `PUSH`/`POP`/`CALL`/`RET`/`LEAVE`, branchless `CSEL` conditional exits, self-loop superblocks, and hardware 128-bit ARMv8 NEON SIMD lowering (**104.5×** speedup on `hyperion_tier_bench`; **5.17×–20.12×** end-to-end speedup across 5 real `gcc 14.2 -O2 -static` `glibc 2.41` C workloads totaling `120,313,691` dynamic instructions with `0` step discrepancy).
+- **Real-world benchmark & evaluation suite (`benchmarks/workloads/*.c`, `scripts/run_real_benchmarks.sh`, `docs/real-world-evaluation.md`, static ELF CTest smoke gate).**
 
 ---
 
-## [Unreleased] — Distribution: prebuilt static binaries and a release workflow
+## [0.2.0-pre] — Audits, ISA/ELF64 foundation, initial Tier 0/1 optimizations, and 15 additional Phase 6 syscalls
+
+### Fixed
+- **Critical codegen bug (`adds_imm`/`subs_imm` `shift12`):** `aarch64_encoder.cpp` hardcoded `sh = 0` (`bit 22`) on flag-setting shifted immediates and `translator.cpp` dropped `shift12`, miscompiling e.g. `add rax, 0x1000` into `add rax, 1` when `AF` was dead. Verified bit-for-bit against GNU binutils 2.44 and guarded by `translator.shifted_imm12_folded_alu_matches_interpreter`.
+- **Critical decoder/interpreter bugs:** fixed `pop rsp` stack adjustment order (`rsp` set to popped value rather than old `rsp + 8`), `SIB mod=00, base=5` (`[disp32]` / `[index*scale + disp32]`), `0x90` with `REX.B == 1` (`xchg r8, rax`), multiple REX prefixes + 15-byte `DecodeError::kTooLong` architectural length limit, and single-instruction `syscall`/`hlt` translation.
+- **Address space & NX hazards:** enforced `MemPerm::kExec` on instruction fetch (`Memory::fetch`), preserved existing heap data across page-crossing `set_brk()` calls, honoured `max_map_bytes_`, split mapped regions at page boundaries for sub-region `mprotect`/`munmap`, and added `Memory::code_epoch()` cache invalidation in Tier 0 and Tier 1.
+- **Unbuffered POSIX file descriptors:** replaced buffered `std::FILE*` fd slots with refcounted `OpenFileDescription` descriptors and fixed zero-extended 32-bit `mov edi, AT_FDCWD` handling across all `*at` syscalls.
+- **Syscall inventory CI enforcement:** upgraded `tools/gen_syscall_inventory.py --check` to cross-check `src/core/syscall.cpp` (`MinimalSyscallHandler::handle` and `is_minimal_syscall`), `docs/syscalls/inventory.tsv`, and generated Markdown tables bidirectionally.
 
 ### Added
-- **`scripts/package.sh`** — builds self-contained release tarballs for x86-64
-  and AArch64. Each tarball holds a **statically linked** `hyperion` (no loader,
-  no shared libraries), the licence and the three documents a first-time user
-  needs. Static linking is deliberate: the reference device is AArch64 Android
-  with no root, so a single self-contained file is the artefact that runs there.
-  Writes `dist/SHA256SUMS` (sha256sum or shasum).
-- **`.github/workflows/release.yml`** — on a `v*` tag: builds, runs the full
-  test suite (a release is never published from a build that fails its own
-  tests), packages both architectures, smoke-tests the packaged binaries
-  (including the AArch64 one under `qemu-user` with a real `--tier=1`
-  translation), verifies the checksums, and publishes a GitHub pre-release.
-  First exercised for tag `v0.1.0-experimental` (run green; assets
-  re-downloaded and verified).
-- **`hyperion package`** — wrapper command for `scripts/package.sh`.
-- **`docs/iso-boot-investigation.md`** — records the ISO/boot experiment and its
-  honest negative result (see Changed).
-
-### Changed
-- `README.md`: new "Getting a binary without building anything" section.
-- `scripts/hyperion`: `status` no longer understates the project (memory
-  operands in Tier 1 are listed; the stale "seven slices" count corrected to
-  ten); `help` advertises `package`.
-- `tests/cli/wrapper_test.sh`: asserts `help` advertises `package`.
-- `.gitignore`: ignores `dist/` (reproducible packaging output).
-
-### Notes
-- No target-device performance claim is made. The AArch64 tarball was verified
-  to *execute generated code* under `qemu-user`; `qemu-user` is not a
-  performance measurement (LIM-004).
-
----
-
-## [Unreleased] — Phase 6/7: ALU and INC/DEC memory operands (soft MMU)
-
-### Added
-- **ALU read-modify-write and INC/DEC memory operands in Tier 1.**
-  `add/sub/and/or/xor/cmp r,[mem]`, `... [mem],r`, the immediate form
-  `add/sub/and/or/xor [mem],imm`, and `inc/dec [mem]` now lower to a
-  soft-MMU helper load, the register operation, and (except for `cmp`, which
-  writes only flags) a helper store. They reuse the MOV path and its fault
-  contract exactly (D-032): a load or store fault exits the block with
-  `BlockResult::kMemoryFault` and `rip` on the faulting instruction.
-- Tests: `translator.translates_alu_memory_forms` (15 encodings, bytes checked
-  against GNU `as`/`objdump`), and the AArch64 differentials
-  `translator.differential_alu_memory_operands` (a read-modify-write chain plus
-  `cmp` through memory, comparing registers, all six flags and the memory word
-  against the interpreter) and `translator.differential_alu_memory_fault_is_reported`.
-
-### Changed
-- `translator.cpp`: `emit_one`'s ALU case and INC/DEC case each gained a memory
-  path (dst or src memory). `validate_body` now accepts register, immediate and
-  memory operands for every body opcode, refusing only two memory operands and
-  non-body operand kinds. `regs_read_write` no longer attributes a memory
-  destination to a guest register, so the allocator stops counting and pinning a
-  register the instruction does not touch.
-
-### Known limitations
-- LIM-018: an ALU read-modify-write recomputes its effective address, because
-  the load helper call clobbers the scratch registers that held it.
-
----
-
-## [Unreleased] — Phase 6/7: MOV memory operands in the code generator (soft MMU)
-
-### Added
-- **MOV memory operands in Tier 1.** `mov r64, [mem]`, `mov [mem], r64` and
-  their 32-bit forms now lower to a call into a runtime load/store helper
-  instead of being refused. The effective address (`base + index*scale + disp`,
-  all mod 2^64) is computed in the generated code and the access is resolved
-  through the same `Memory` interface the interpreter uses, so guest address `A`
-  is never treated as host address `A`. This removes the single biggest gap
-  between the tiers and lets a translated program read and write memory.
-- `include/hyperion/runtime_helpers.hpp`, `src/core/runtime_helpers.cpp`:
-  `hyperion_load`/`hyperion_store` (C ABI, called from generated code) plus a
-  thread-local `Memory*` (`current_memory`/`set_current_memory`). A load returns
-  `LoadResult{value, fault}` in x0/x1 (AAPCS64); a store returns the fault flag
-  in x0. No `Memory` installed, or an unmapped address, sets the fault flag —
-  the helper never dereferences a stale pointer.
-- `BlockResult::kMemoryFault`: a translated load/store that faults exits its
-  block with `rip` on the faulting instruction; the dispatcher maps it to
-  `RunStatus::kFault`. A fault is never a silent wrong value.
-- `a64::Encoder::cbnz` (compare-and-branch on non-zero), used to test a helper's
-  fault flag in one instruction.
-- Tests: `translator.translates_mov_memory_forms`, the AArch64 differentials
-  `translator.differential_memory_operands` (store/load round trip, 32-bit
-  forms, SIB addressing) and `translator.differential_memory_fault_is_reported`,
-  `syscall.mmap_end_to_end_under_generated_code` (a raw `mmap` + store runs end
-  to end through generated code), and four `runtime_helpers` unit tests.
-
-### Changed
-- `translator.cpp`: `validate_body` accepted a MOV memory operand and refused
-  every other memory operand at the time of this milestone (the ALU
-  read-modify-write forms landed in the following increment), so an unsupported
-  memory form was refused, not mistranslated.
-  `regs_read_write` counts a memory operand's base/index registers as reads.
-- `TranslationCache::run` installs the run's `Memory` in the helper's thread-local
-  for the duration of the run (RAII, restored on exit, so nested runs are safe).
-- `runtime_helpers.hpp`: `LoadResult` and the two helpers are declared at global
-  scope with the C ABI they are called through; the clang
-  `-Wreturn-type-c-linkage` warning on the struct return is suppressed locally
-  with a comment (the two-register layout is the contract, not an accident).
-- `syscall.mmap_end_to_end_under_generated_code_stops_at_memory_operand` is
-  replaced by `syscall.mmap_end_to_end_under_generated_code`, which now asserts
-  the store succeeds under generated code (the boundary it pinned has moved).
+- **Static ELF64 loader & SysV AMD64 stack (`elf_loader.{hpp,cpp}`):** loads static `ET_EXEC` and static-PIE `ET_DYN` x86-64 binaries with page-aligned W^X `PT_LOAD` mappings, BSS zero-fill, and 16-byte aligned `argc`/`argv`/`envp`/`auxv` stacks; wired into `hyperion info <exe>` and `hyperion run <exe>`.
+- **Expanded x86-64 ISA subset:** `[rip + disp32]` addressing, `LEA` (`0x8D`, Tier 0 & Tier 1), `TEST` (`0x85`, `0xA9`, `0xF7 /0`, Tier 0 & Tier 1), near `Jcc rel32` (`0x0F 0x80..0x8F`, Tier 0 & Tier 1), and accumulator-immediate ALU forms (`0x05..0x3D`).
+- **Tier 1 & Tier 0 performance engine:** multi-page W^X `ExecArena`, 2-way inline block chaining, hardware `NZCV` condition fusion (`ADD/SUB/CMP/INC/DEC/AND/OR/XOR/TEST -> Jcc`), native self-loop superblocks (**11.19×** narrow / **11.16×** wide Tier 1 speedup), `strb wzr` flag clearing (`OPT-001`), 5-instruction `mvn`+`ubfx` parity (`OPT-002`), MRU region cache, and Tier 0 2048-slot epoch-keyed decoded-instruction cache (**3.47×** narrow / **2.90×** wide speedup).
+- **15 additional Linux syscalls (42 total across 11 slices):** `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `uname`(63, always advertising `"x86_64"`), `fcntl`(72), `gettimeofday`(96), `arch_prctl`(158), `set_tid_address`(218), `clock_gettime`(228), `set_robust_list`(273), `dup3`(292), and `prlimit64`(302).
 
 ---
 

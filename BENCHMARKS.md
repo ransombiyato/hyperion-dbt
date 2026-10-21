@@ -522,6 +522,47 @@ offsets it exactly).
 program that caught it) now locks the regression out; every other
 `check_program_matches` program compares `rip` as well.
 
+#### 4.2.8 Phase 5 Optimization Pass — `ExecArena`, 2-Way Chaining, Hardware `NZCV` Fusion, Self-Loop Superblocks, and Tier 0 Decoded ICache
+
+- **Date / commit:** 2026-10-21 / `921c7bd` (compared against unmodified `03487fc` on the identical host, compiler, flags, and `--iterations 200000 --repeats 7` invocations)
+- **Host:** Linux 6.1.158+ x86_64, GCC 14.2.0 `RelWithDebInfo`, `qemu-aarch64` 10.0.13
+- **Commands:**
+  - `./build/dev/benchmarks/hyperion_tier_bench --iterations 200000 --repeats 7 --json`
+  - `./build/dev/benchmarks/hyperion_tier_bench --wide --iterations 200000 --repeats 7 --json`
+  - `./scripts/bench-tier-qemu.sh --iterations 200000 --repeats 7 --json`
+  - `./scripts/bench-tier-qemu.sh --wide --iterations 200000 --repeats 7 --json`
+
+| Workload (`200,000` iters, `7` repeats, 1 warm-up discarded) | Baseline (`03487fc`) | Optimized (`921c7bd`) | Speedup / Change |
+| --- | ---: | ---: | ---: |
+| **Native x86-64 Tier 0 — Narrow (`600,002` insns)** | `24,831,247 ns` (`41.385 ns/insn`) | `7,146,357 ns` (`11.911 ns/insn`) | **3.47× faster** |
+| **Native x86-64 Tier 0 — Wide (`2,400,002` insns)** | `110,085,761 ns` (`45.869 ns/insn`) | `37,994,884 ns` (`15.831 ns/insn`) | **2.90× faster** |
+| **`qemu-aarch64` Tier 0 — Narrow (`600,002` insns)** | `392,312,068 ns` (`653.851 ns/insn`) | `117,819,894 ns` (`196.366 ns/insn`) | **3.33× faster** |
+| **`qemu-aarch64` Tier 0 — Wide (`2,400,002` insns)** | `1,624,420,613 ns` (`676.841 ns/insn`) | `517,432,047 ns` (`215.597 ns/insn`) | **3.14× faster** |
+| **`qemu-aarch64` Tier 1 — Narrow (`600,002` insns)** | `21,337,245 ns` (`35.562 ns/insn`, `356 B` code) | `1,906,672 ns` (`3.178 ns/insn`, `344 B` code) | **11.19× faster** (`−3.4%` code) |
+| **`qemu-aarch64` Tier 1 — Wide (`2,400,002` insns)** | `25,038,216 ns` (`10.433 ns/insn`) | `2,244,315 ns` (`0.935 ns/insn`, `624 B` code) | **11.16× faster** (`230.6×` over Tier 0) |
+
+- **Correctness:** 100% pass across all native CTest suites, Clang Debug build, ASan + UBSan build, and AArch64 cross-tests (`translator.translated_code_size_is_bounded` <= 88 words preserved; exact `steps` and `dispatch_hits` accounting verified with and without `max_steps`). Note per §5 rule 5: `qemu-aarch64` numbers measure relative improvements on the identical host rather than Snapdragon 855 silicon timing.
+
+#### 4.2.9 Full-System AArch64 + 128-bit ARMv8 NEON Tier 1 JIT & Real Compiled `glibc 2.41` Binary Evaluation
+
+- **Date:** 2026-10-21 (compared apples-to-apples on the identical Linux `6.1.158+` `x86_64` host, `GCC 14.2.0` `RelWithDebInfo`, `glibc 2.41`, `qemu-aarch64` `10.0.13`)
+- **Commands:**
+  - `qemu-aarch64-static ./build/cross-bench/benchmarks/hyperion_tier_bench` (`N = 5`, 1 warm-up discarded, `3,000,002` retired guest instructions)
+  - `./scripts/run_real_benchmarks.sh` (`N = 5`, 1 warm-up discarded, 5 real `gcc 14.2 -O2 -static` C binaries totaling `120,313,691` dynamic x86-64 + SSE2 instructions)
+
+| Workload (`N = 5`, 1 warm-up discarded) | Guest Insns | Tier 0 (`qemu-aarch64`) Median | **Tier 1 ARMv8+NEON JIT (`qemu-aarch64`) Median** | **Speedup vs Tier 0** |
+| --- | ---: | ---: | ---: | ---: |
+| **`hyperion_tier_bench` (loop kernel)** | `3,000,002` | `797.05 ms` (`265.68 ns/insn`) | **`7.63 ms` (`2.54 ns/insn`, `393.3 MIPS`)** | **`104.49×`** |
+| **`sieve` (`1,000,000` primes, `glibc 2.41`)** | `16,990,070` | `4,665.15 ms` | **`903.06 ms` (`18.81 MIPS`)** | **`5.17×`** |
+| **`sha256` (`256 KiB` auto-vectorized SSE2)** | `20,682,677` | `5,792.50 ms` | **`287.84 ms` (`71.86 MIPS`, `13.92 ns/insn`)** | **`20.12×`** |
+| **`qsort_glibc` (`50,000` `int64` `glibc` `qsort`)** | `21,606,066` | `6,450.06 ms` | **`864.64 ms` (`24.99 MIPS`)** | **`7.46×`** |
+| **`quicksort_c` (`100,000` `int32` Hoare sort)** | `21,672,163` | `6,046.26 ms` | **`539.53 ms` (`40.17 MIPS`)** | **`11.21×`** |
+| **`nqueens` (`N = 12` bitboard recursion)** | `39,362,715` | `10,722.29 ms` | **`633.08 ms` (`62.18 MIPS`, `16.08 ns/insn`)** | **`16.94×`** |
+| **Total across 5 full static `glibc 2.41` binaries** | **`120,313,691`** | **`33,676.26 ms`** | **`3,228.15 ms` (`37.27 MIPS` overall)** | **`10.43×`** |
+
+- **Native x86-64 Tier 0 single-core throughput (`N = 5`):** `55.79`–`60.67 MIPS` (`16.48`–`17.92 ns/insn`, `2,069.70 ms` total across all `120,313,691` instructions).
+- **Correctness:** Exact `0`-step discrepancy (`x86_64 Tier 0 == aarch64 Tier 0 == aarch64 Tier 1`) and 100% bit-exact output across all `120,313,691` dynamic instructions; see [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md).
+
 ### 4.3 Reference target device (Snapdragon 855)
 
 **unavailable.** The reference device is not present in this environment.

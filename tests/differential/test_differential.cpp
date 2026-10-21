@@ -24,6 +24,7 @@
 
 #include "harness/test_harness.hpp"
 #include "hyperion/decoder.hpp"
+#include "hyperion/exec_mem.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/interpreter.hpp"
 
@@ -61,14 +62,16 @@ GuestState interp(const std::vector<std::uint8_t>& code, std::uint64_t a, std::u
     state.reg(Gpr::kRbx) = b;
     state.flags = hyperion::unpack_flags(f);
     state.rip = kBase;
-    for (int i = 0; i < 16; ++i) {
+    bool halted = false;
+    for (int i = 0; i < 64; ++i) {
         const auto r = hyperion::step(state, memory);
         if (r.status == StepStatus::kHalted) {
+            halted = true;
             break;
         }
         HYPERION_CHECK_EQ(static_cast<int>(r.status), static_cast<int>(StepStatus::kOk));
-        break;
     }
+    HYPERION_CHECK(halted);
     return state;
 }
 
@@ -364,6 +367,119 @@ HYPERION_TEST("differential", "alu_imm8_sign_extends") {
             HYPERION_CHECK_EQ(hyperion::pack_flags(actual.flags), model_flags(expected.flags));
         }
     }
+#else
+    HYPERION_SKIP("requires an x86-64 host to execute the reference instructions");
+#endif
+}
+
+// Multi-step sequence & `popq %rsp` hardware differential: verifies both that
+// `interp()` runs past step 1 to `hlt` AND that `popq %rsp` loads the target
+// stack pointer rather than overwriting it with old_rsp + 8.
+HYPERION_TEST("differential", "multi_step_and_pop_rsp_match_hardware") {
+#if defined(__x86_64__)
+    // Multi-step sequence: addq $0x1000, %rax ; addq %rbx, %rax ; hlt
+    const std::vector<std::uint8_t> seq = {
+        0x48, 0x05, 0x00, 0x10, 0x00, 0x00, // add rax, 0x1000
+        0x48, 0x01, 0xD8,                   // add rax, rbx
+        0xF4,                               // hlt
+    };
+    const NativeResult hw_seq = HYPERION_NATIVE_ALU("addq $0x1000, %%rax\n\taddq %%rbx, %%rax")(
+        0xFF8ULL, 0x20ULL, kRflagsBit1);
+    const GuestState interp_seq = interp(seq, 0xFF8ULL, 0x20ULL, kRflagsBit1);
+    HYPERION_CHECK_EQ(interp_seq.reg(Gpr::kRax), hw_seq.value);
+    HYPERION_CHECK_EQ(hyperion::pack_flags(interp_seq.flags), model_flags(hw_seq.flags));
+
+    // Hardware `popq %rsp` check: place `target_rsp` in a 2-qword scratch slot,
+    // point %rsp at it momentarily, execute `popq %rsp`, read %rsp out, restore.
+    alignas(16) std::uint64_t slot[2] = {0xCAFEBABE12345670ULL, 0};
+    std::uint64_t hw_rsp_after = 0;
+    asm volatile("movq %%rsp, %%r11\n\t"
+                 "leaq %[slot], %%rsp\n\t"
+                 "popq %%rsp\n\t"
+                 "movq %%rsp, %[out]\n\t"
+                 "movq %%r11, %%rsp\n\t"
+                 : [out] "=r"(hw_rsp_after)
+                 : [slot] "m"(slot[0])
+                 : "r11", "memory");
+
+    FlatMemory mem(kBase, 4096);
+    mem.data()[0] = 0x5C; // pop rsp
+    mem.data()[1] = 0xF4; // hlt
+    std::memcpy(mem.data() + 0x800, &slot[0], sizeof(slot[0]));
+    GuestState st;
+    st.rip = kBase;
+    st.reg(Gpr::kRsp) = kBase + 0x800;
+    const auto rr = hyperion::run_program(mem, st, 16);
+    HYPERION_CHECK(rr.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(rr.state.reg(Gpr::kRsp), hw_rsp_after);
+#else
+    HYPERION_SKIP("requires an x86-64 host to execute the reference instructions");
+#endif
+}
+
+HYPERION_TEST("differential", "rip_relative_lea_test_and_near_jcc_match_hardware") {
+#if defined(__x86_64__)
+    // Verify RIP-relative load, RIP-relative CMP with trailing imm8 (`83 3D`),
+    // 32-bit zero-extending LEA (`8D 4C CB F0`), 64-bit TEST (`48 85 C2`), and
+    // near Jcc rel32 (`0F 85`, `0F 88`) against BOTH Tier 0 and native silicon!
+    alignas(16) std::uint8_t page[512] = {};
+    // [0..6]   48 8B 05 39 00 00 00   mov rax, [rip + 0x39]      -> reads page[0x40]
+    // [7..13]  83 3D 3A 00 00 00 2A   cmp dword [rip + 0x3A], 42 -> reads page[0x48] (== 42)
+    // [14..19] 0F 85 0E 00 00 00      jne fail (+14 -> page[34])
+    // [20..23] 8D 4C CB F0            lea ecx, [rbx + rcx*8 - 16]
+    // [24..26] 48 85 C2               test rax, rdx
+    // [27..32] 0F 88 01 00 00 00      js ok (+1 -> page[34])
+    // [33]     C3                     ret (not reached when JS taken)
+    // [34..37] 48 83 C1 07            add rcx, 7
+    // [38]     C3                     ret
+    const std::uint8_t prog[] = {
+        0x48, 0x8B, 0x05, 0x39, 0x00, 0x00, 0x00, // [0..6]
+        0x83, 0x3D, 0x3A, 0x00, 0x00, 0x00, 0x2A, // [7..13] next_rip=14 -> 14+0x3A = 0x48
+        0x0F, 0x85, 0x0E, 0x00, 0x00, 0x00,       // [14..19]
+        0x8D, 0x4C, 0xCB, 0xF0,                   // [20..23]
+        0x48, 0x85, 0xC2,                         // [24..26]
+        0x0F, 0x88, 0x01, 0x00, 0x00, 0x00,       // [27..32]
+        0xC3,                                     // [33]
+        0x48, 0x83, 0xC1, 0x07,                   // [34..37]
+        0xC3,                                     // [38]
+    };
+    std::memcpy(page, prog, sizeof(prog));
+    const std::uint64_t qword_at_40 = 0x8000000012345678ULL;
+    const std::uint32_t dword_at_48 = 42u;
+    std::memcpy(page + 0x40, &qword_at_40, sizeof(qword_at_40));
+    std::memcpy(page + 0x48, &dword_at_48, sizeof(dword_at_48));
+
+    // 1. Execute `page` directly on real x86-64 hardware via W^X ExecMem.
+    hyperion::ExecMem exec(sizeof(page));
+    exec.write(0, page, sizeof(page));
+    exec.finalize();
+    const void* fn_ptr = exec.entry();
+    std::uint64_t hw_rax = 0;
+    std::uint64_t hw_rbx = 0xFFFFFFFF00001000ULL;
+    std::uint64_t hw_rcx = 0xFFFF000000000004ULL;
+    std::uint64_t hw_rdx = 0x8000000000000000ULL;
+    asm volatile("call *%[fn]\n\t"
+                 : "+a"(hw_rax), "+b"(hw_rbx), "+c"(hw_rcx), "+d"(hw_rdx)
+                 : [fn] "r"(fn_ptr)
+                 : "cc", "memory");
+
+    // 2. Execute the exact same machine code in Tier 0 and compare bit-for-bit.
+    FlatMemory mem(kBase, 4096);
+    std::memcpy(mem.data(), page, sizeof(page));
+    GuestState st;
+    st.rip = kBase;
+    st.reg(Gpr::kRbx) = 0xFFFFFFFF00001000ULL;
+    st.reg(Gpr::kRcx) = 0xFFFF000000000004ULL;
+    st.reg(Gpr::kRdx) = 0x8000000000000000ULL;
+
+    const auto rr = hyperion::run_program(mem, st, 32);
+    HYPERION_CHECK(rr.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(rr.state.reg(Gpr::kRax), hw_rax);
+    HYPERION_CHECK_EQ(rr.state.reg(Gpr::kRbx), hw_rbx);
+    HYPERION_CHECK_EQ(rr.state.reg(Gpr::kRcx), hw_rcx);
+    HYPERION_CHECK_EQ(rr.state.reg(Gpr::kRdx), hw_rdx);
+    HYPERION_CHECK_EQ(hw_rcx, 0x1017ULL);
+    HYPERION_CHECK_EQ(rr.state.rip, kBase + 38);
 #else
     HYPERION_SKIP("requires an x86-64 host to execute the reference instructions");
 #endif

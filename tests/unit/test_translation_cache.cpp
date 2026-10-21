@@ -121,6 +121,50 @@ HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
     HYPERION_CHECK_EQ(cache.block_count(), std::size_t{2});        // not re-translated
 }
 
+HYPERION_TEST("translation_cache",
+              "self_loop_superblock_matches_interpreter_with_and_without_step_limit") {
+    // Tight self-loop exercising both full completion and mid-loop step-budget
+    // cut-off (`max_steps = 11` -> 3 iterations = 9 steps, stopping before 4th),
+    // verifying all GPRs, rip, and all 6 architectural flags match Tier 0.
+    //   loop: add rdx, rax ; sub rcx, rax ; jnz loop ; hlt
+    const std::vector<std::uint8_t> program = {
+        0x48, 0x01, 0xC2, // add rdx, rax
+        0x48, 0x29, 0xC1, // sub rcx, rax
+        0x75, 0xF8,       // jnz loop
+        0xF4,             // hlt
+    };
+
+    for (const std::uint64_t limit : {std::uint64_t{11}, std::uint64_t{1000}}) {
+        GuestState initial;
+        initial.rip = kBase;
+        initial.reg(Gpr::kRax) = 3;
+        initial.reg(Gpr::kRcx) = 30; // 10 iterations total
+        initial.reg(Gpr::kRdx) = 0xFF;
+
+        FlatMemory m0(kBase, kMemSize);
+        std::memcpy(m0.data(), program.data(), program.size());
+        const hyperion::RunResult exp =
+            hyperion::run_program(m0, initial, (limit == 11) ? 9 : limit);
+
+        FlatMemory m1(kBase, kMemSize);
+        std::memcpy(m1.data(), program.data(), program.size());
+        TranslationCache cache;
+        const hyperion::RunResult got = cache.run(m1, initial, limit);
+
+        HYPERION_CHECK_EQ(got.steps, exp.steps);
+        HYPERION_CHECK_EQ(got.state.rip, exp.state.rip);
+        HYPERION_CHECK_EQ(got.state.reg(Gpr::kRax), exp.state.reg(Gpr::kRax));
+        HYPERION_CHECK_EQ(got.state.reg(Gpr::kRcx), exp.state.reg(Gpr::kRcx));
+        HYPERION_CHECK_EQ(got.state.reg(Gpr::kRdx), exp.state.reg(Gpr::kRdx));
+        HYPERION_CHECK_EQ(got.state.flags.cf, exp.state.flags.cf);
+        HYPERION_CHECK_EQ(got.state.flags.pf, exp.state.flags.pf);
+        HYPERION_CHECK_EQ(got.state.flags.af, exp.state.flags.af);
+        HYPERION_CHECK_EQ(got.state.flags.zf, exp.state.flags.zf);
+        HYPERION_CHECK_EQ(got.state.flags.sf, exp.state.flags.sf);
+        HYPERION_CHECK_EQ(got.state.flags.of, exp.state.flags.of);
+    }
+}
+
 #else
 
 HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") {
@@ -128,6 +172,11 @@ HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") 
 }
 
 HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache",
+              "self_loop_superblock_matches_interpreter_with_and_without_step_limit") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

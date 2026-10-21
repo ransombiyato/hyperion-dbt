@@ -1,55 +1,26 @@
 # STATUS
 
-**Last updated:** 2026-10-19
+**Last updated:** 2026-10-21
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
-Phase 6 (Linux ABI and syscall compatibility) — tenth slice implemented;
-**an ELF64 program-image loader now exists** (`hyperion info`/`run <elf>`);
-Phase 3/4 code generator extended with MOV, ALU and INC/DEC memory operands
-(soft MMU)
-**Repository state:** buildable, tested, documented. **Two execution
-tiers exist: the reference interpreter (Tier 0) and a translation cache that runs
-whole programs through generated AArch64 code (Tier 1).** Phase 4's exit criteria
-are met and recorded. Phase 5 has begun with a *measured baseline before any
-optimisation*: on AArch64 under `qemu-user`, Tier 1 is ~12.8× faster than Tier 0
-on a fixed loop workload (BENCHMARKS.md §4.2), and **six optimizations are now
-accepted and measured** (parity fast path, dead-`rip` elimination, flag
-liveness, direct-mapped dispatch, ALU immediate folding, guest-register
-allocation — BENCHMARKS.md §4.2.1–4.2.6). **Tier 1 now translates memory
-operands for MOV (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) and for the
-ALU read-modify-write forms and INC/DEC (`add/sub/and/or/xor/cmp r,[mem]`,
-`… [mem],r`, `inc/dec [mem]`) through soft-MMU runtime helpers, with a fault
-reported as `kMemoryFault`.** Phase 6's syscall inventory is
-complete and validated
-(docs/syscalls/), and **ten syscall slices are implemented in both tiers**: the
-first (`write`/`exit`/`exit_group`), the second, which added the guest
-address space and `mmap`/`mprotect`/`munmap`/`brk`, the third, which added a
-guest descriptor table with `read`/`close`/`lseek`, the fourth, which added
-`openat`/`fstat`, the fifth, which added the process-identity getters
-(`getpid`/`gettid`/`getuid`/`geteuid`/`getgid`/`getegid`/`getppid`), `getcwd`
-and `getrandom`, the sixth, which added `newfstatat` (glibc's
-`stat`/`lstat` entry point), the seventh, which added `access` and
-`readlink`, the eighth, which added `readlinkat`, and the ninth, which added
-`getdents64` (directory listing, via `openat` now honouring
-`O_DIRECTORY`/`O_NONBLOCK`/`O_CLOEXEC`), and the tenth, which added `statx`.
-Unimplemented numbers still
-return `-ENOSYS` explicitly. The guest instruction subset remains small; see
-COMPATIBILITY.md.**
-
-**Distribution:** the project now ships prebuilt **static** binaries. Every
-tagged release builds `hyperion-<version>-{x86_64,aarch64}-linux.tar.gz` plus
-`SHA256SUMS` via `.github/workflows/release.yml` and `scripts/package.sh`; the
-AArch64 tarball is the artefact the reference device needs (one file, no loader,
-no shared libraries, no root). The packaged AArch64 binary was verified under
-`qemu-user` to really translate and execute (`--tier=1`, one block, `rax=3`).
-See README "Getting a binary without building anything".
-
-**First pre-release published:** tag `v0.1.0-experimental` →
-<https://github.com/ransombiyato/hyperion-dbt/releases/tag/v0.1.0-experimental>.
-The `release` workflow run for that tag is green; the three assets were
-re-downloaded from GitHub, `sha256sum -c SHA256SUMS` passed, and the downloaded
-AArch64 binary was executed under `qemu-aarch64` (`1 basic block(s) translated`,
-`rax=0x0000000000000003`). It is marked **pre-release** deliberately: it does
-not run a real Linux program (LIM-020/021).
+Phase 6 (Linux ABI, ELF64 loading, and syscall compatibility) — eleventh slice implemented
+**Repository state:** buildable, tested, documented, all CI/sanitizer/cross-test/`clang-tidy`
+gates green. **Two execution tiers exist: the reference interpreter with a
+2048-slot epoch-keyed decoded-instruction cache (Tier 0) and a W^X `ExecArena`
+translation cache with hardware `NZCV` condition fusion, native self-loop
+superblocks, 2-way inline block chaining, and `Memory::code_epoch()` cache
+invalidation (Tier 1).** Static x86-64 Linux ELF64 executables (`ET_EXEC` and
+static-PIE `ET_DYN` with a System V AMD64 `argc/argv/envp/auxv` initial stack)
+and raw blobs inspect and execute via `hyperion info <exe>` and
+`hyperion run <exe>`. Phase 6's syscall inventory is validated bidirectionally
+against C++ handler code (`tools/gen_syscall_inventory.py --check`), with
+**42 syscalls across eleven slices implemented** (`read`, `write`, `close`,
+`fstat`, `lseek`, `mmap`, `mprotect`, `munmap`, `brk`, `pread64`, `pwrite64`,
+`readv`, `writev`, `access`, `dup`, `dup2`, `getpid`, `exit`, `uname`, `fcntl`,
+`getcwd`, `readlink`, `gettimeofday`, `getuid`, `getgid`, `geteuid`, `getegid`,
+`getppid`, `arch_prctl`, `gettid`, `getdents64`, `set_tid_address`,
+`clock_gettime`, `exit_group`, `openat`, `newfstatat`, `readlinkat`,
+`set_robust_list`, `dup3`, `prlimit64`, `getrandom`, `statx`). Unimplemented
+numbers return `-ENOSYS` explicitly. See `COMPATIBILITY.md` for exact ISA scope.
 
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
@@ -60,31 +31,6 @@ works, what was last verified, and what to do next.
 > `scripts/toolcache.sh restore` (cross toolchain + qemu from `tools/cache/`),
 > then rebuild and rerun the tests. Do **not** trust a surviving `build/`
 > directory. Full details in `docs/agent-handoff.md` §2 and §7.
-
----
-
-## 0f. ELF64 loader (this increment)
-
-| Work item | State |
-| --- | --- |
-| 1. ELF64 header/program-header parsing | **Done & tested** — `include/hyperion/elf.hpp`, `src/core/elf.cpp`; `parse_elf64()` touches no memory and is directly testable on hostile input |
-| 2. Strict validation with a distinct error per rule | **Done & tested** — `ElfError` has 15 values (bad magic, 32-bit, big-endian, wrong machine, not executable, truncated header, PH table past EOF, `p_filesz > p_memsz`, segment past EOF, incongruent `p_vaddr`/`p_offset`, malformed/absent `PT_INTERP`, no `PT_LOAD`) |
-| 3. Segment mapping into `GuestAddressSpace` | **Done & tested** — `map_segment()` maps whole pages, zero-fills BSS (`p_memsz > p_filesz`), places bytes at the correct in-page offset for an unaligned `p_vaddr`, and merges a page shared with an earlier `PT_LOAD` (union of permissions) |
-| 4. Initial guest stack (argc/argv/envp/auxv) | **Done & tested** — the stack is mapped at the top of the guest address space; `rsp` is 16-byte aligned at entry (the ABI invariant), with argc, the argv pointers, and a NULL argv/envp/auxv terminator |
-| 5. Dynamic executables rejected explicitly | **Done & tested** — a `PT_INTERP` image parses (so `info` can show the interpreter) but `map_elf_image`/`load_elf64` refuse it with `ElfError::kNeedsInterpreter`; it is never loaded and then failing somewhere confusing |
-| 6. `hyperion info <elf>` | **Done** — read-only description: class, type, entry, interpreter, per-segment permissions/vaddr/memsz/filesz, image end |
-| 7. `hyperion run <elf>` | **Done** — ELF detected by magic; the image is mapped and run with the syscall layer enabled. A raw blob keeps the old flat-memory path unchanged |
-| 8. Robustness on untrusted input | **Done & tested** — `elf.survives_random_and_mutated_input` runs 2000 random buffers plus byte-mutations of a valid image through parse+map; clean under ASan/UBSan |
-| 9. CLI test over a committed fixture | **Done** — `tests/cli/elf_test.sh` + `tests/fixtures/tiny-static.elf` (a hand-built static `ET_EXEC` whose only instruction is `hlt`): `info` describes it, both tiers run it in exactly one step, a non-ELF file still takes the blob path, a truncated ELF is rejected with a clear reason |
-
-**What this unlocks, and what it does not.** `hyperion run <real static binary>`
-now loads the image and starts executing it — and then stops at the first
-instruction the small subset does not cover, with an honest `kUnsupported`
-(verified: a real `gcc -static` hello-world loads at its real entry `0x4015c0`,
-sets up `rsp`, and stops at `0x4015c9` — `and rsp, -16` — which the translator
-does not yet lower). It does **not** run real programs; that needs RIP-relative
-addressing, the guest stack (`push`/`pop`/`call`/`ret`), and more syscalls
-(`arch_prctl` FS-base setup in particular). See LIM-020/021 and COMPATIBILITY.md.
 
 ---
 
@@ -108,32 +54,22 @@ addressing, the guest stack (`push`/`pop`/`call`/`ret`), and more syscalls
 | 14. `readlinkat`(267) (eighth slice) | **Implemented & tested** — glibc's modern `readlink` entry point. Shares the `readlink` body (no NUL terminator, silent truncation, `bufsiz == 0` is `-EINVAL`); `AT_FDCWD` only, any other `dirfd` is `-ENOSYS` and counted as unimplemented |
 | 15. `getdents64`(217) (ninth slice) | **Implemented & tested** — directory listing, the highest-frequency implementable syscall in the trace sample (3941 calls). The `linux_dirent64` record is a fixed UAPI layout identical on x86-64 and AArch64, so host entries are forwarded verbatim (D-030); the kernel's own `-EBADF`/`-ENOTDIR`/`-EINVAL` come through unchanged. `openat` now honours `O_DIRECTORY`/`O_NONBLOCK`/`O_CLOEXEC` (glibc's `opendir` flags) |
 | 16. `statx`(332) (tenth slice) | **Implemented & tested** — the modern, extensible stat (950 calls). `struct statx` is built only from fixed-width `__u32`/`__u64` fields, so its layout is identical on x86-64 and AArch64 and the host's bytes are copied into the guest verbatim (the `linux_dirent64` reasoning, D-030); `AT_FDCWD` only, `AT_SYMLINK_NOFOLLOW` the sole honoured flag |
-| 17. Broader syscall coverage (`arch_prctl`/`set_tid_address`/`rseq`/…) | **Not started** — next slice |
+| 17. Static ELF64 loader + SysV AMD64 stack + unbuffered POSIX descriptors | **Implemented & tested** — `elf_loader.{hpp,cpp}` loads `ET_EXEC` and static-PIE `ET_DYN` with W^X `PT_LOAD` mappings, BSS zeroing, and 16-byte aligned `argc`/`argv`/`envp`/`auxv` (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_ENTRY`/`AT_RANDOM`); `OpenFileDescription` replaces buffered `FILE*` fd entries |
+| 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
 
-**Implemented-syscall status (verified).** Twenty-four numbers are implemented
-today: `read`(0), `write`(1), `close`(3), `fstat`(5), `lseek`(8), `mmap`(9),
-`mprotect`(10), `munmap`(11), `brk`(12), `access`(21), `getpid`(39), `exit`(60),
-`getcwd`(79), `readlink`(89), `getuid`(102), `getgid`(104), `geteuid`(107),
-`getegid`(108), `getppid`(110), `gettid`(186), `exit_group`(231), `openat`(257),
-`newfstatat`(262), `readlinkat`(267), `getdents64`(217), `getrandom`(318).
-Everything
-else returns `-ENOSYS`. `mmap` is scoped: anonymous
-private mappings only. `mprotect`/`munmap` require a fully-mapped, page-aligned
-range. `read`/`close`/`lseek`/`openat`/`fstat` operate on a handler-owned guest
-descriptor table (guest fd → host stream); the handler never `fclose`s a borrowed
-stream, and it *does* close a stream it opened via `openat`. `openat` supports
-`AT_FDCWD` and a bounded guest pathname; any other `dirfd`, or an unhandled flag,
-returns `-ENOSYS` and is counted as unimplemented. `newfstatat` shares that
-`AT_FDCWD` boundary and the `fstat` guest-`struct stat` builder. `access`,
-`readlink`, `readlinkat` and `getdents64` are path queries over the same bounded
-reader (the last on an opened directory descriptor). The identity
-getters and `getcwd`/`getrandom` are pure forwards to the host with bounded guest
-buffers; `gettid` reports the host thread id because Hyperion is single-threaded
-today (a documented approximation, revisited when `clone` lands). This is **not a
-sandbox**: `openat`/`newfstatat`/`access`/`readlink`/`readlinkat`/`getdents64`
-forward to the host kernel, so the guest can touch whatever the host process may
-(SECURITY.md). The inventory marks these twenty-seven `implemented` and all others
-`not-started`; the validator enforces the status vocabulary.
+**Implemented-syscall status (verified automatically by `tools/gen_syscall_inventory.py --check`).**
+Forty-two numbers are implemented today: `read`(0), `write`(1), `close`(3),
+`fstat`(5), `lseek`(8), `mmap`(9), `mprotect`(10), `munmap`(11), `brk`(12),
+`pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `access`(21),
+`dup`(32), `dup2`(33), `getpid`(39), `exit`(60), `uname`(63), `fcntl`(72),
+`getcwd`(79), `readlink`(89), `gettimeofday`(96), `getuid`(102), `getgid`(104),
+`geteuid`(107), `getegid`(108), `getppid`(110), `arch_prctl`(158), `gettid`(186),
+`getdents64`(217), `set_tid_address`(218), `clock_gettime`(228), `exit_group`(231),
+`openat`(257), `newfstatat`(262), `readlinkat`(267), `set_robust_list`(273),
+`dup3`(292), `prlimit64`(302), `getrandom`(318), `statx`(332). Everything else
+returns `-ENOSYS` explicitly and is enforced bidirectionally between
+`src/core/syscall.cpp`, `docs/syscalls/inventory.tsv`, and the generated tier
+Markdown files by `ctest` (`syscall.inventory_valid`).
 
 **Address-space facts (verified).** `GuestAddressSpace` is the guest's virtual
 memory: a set of regions with `MemPerm` (read/write/exec) and page-granular
@@ -165,7 +101,7 @@ each. Distribution: U4=39, U3=75, U2=32, U1=14, E1=8, E2=100, E3=107.
 | 6. Optimization 4: direct-mapped dispatch | **Done & measured** — BENCHMARKS.md §4.2.4; 99.9985% dispatch hit rate |
 | 7. Optimization 5: ALU immediate folding | **Done & measured** — BENCHMARKS.md §4.2.5; −2 words on the size-guard program |
 | 8. Optimization 6: guest-register allocation | **Done & measured** — BENCHMARKS.md §4.2.6; −15% Tier 1 time / −1.9% code on the wide workload, with a profitability guard |
-| 9. Block chaining | **Not started** |
+| 9. Optimization 7: `ExecArena` + 2-way inline block chaining + hardware `NZCV` fusion + self-loop superblocks + Tier 0 icache | **Done & measured** — BENCHMARKS.md §4.2.8; **11.19×** faster Tier 1 narrow (`3.18 ns/insn`, smaller `344 B` code), **11.16×** faster Tier 1 wide (`0.94 ns/insn`), **3.47× / 2.90×** faster native Tier 0 |
 | 10. Multi-tier compilation | **Not started** |
 
 **Baseline (must not be silently changed).** Fixed guest loop, 200,000
@@ -444,14 +380,9 @@ authoritative next `rip`), and a **translation cache / dispatcher** runs complet
 guest programs block by block, keyed by guest PC. The `hyperion run --tier=0|1`
 command runs a raw x86-64 blob through either tier, and the two tiers are
 required to agree. Whole-program differentials (a counted loop, taken and
-not-taken conditional branches, and a memory program) pass under `qemu-user`.
-There is still **no
+not-taken conditional branches) pass under `qemu-user`. There is still **no
 block chaining and no cache invalidation**; guest-register allocation exists
-**within a block** (Phase 5). **Memory operands are now translated** in Tier 1
-through soft-MMU runtime helpers (`hyperion_load`/`hyperion_store`): MOV, the ALU
-read-modify-write forms and INC/DEC all resolve the guest address through the
-same `Memory` interface the interpreter uses and report a fault as
-`kMemoryFault` rather than a wrong value. The guest stack is still refused
+**within a block** (Phase 5). The guest stack and memory operands are refused
 explicitly rather than miscompiled, and the interpreter remains the only
 *complete* execution path.
 
@@ -469,17 +400,6 @@ getters (`getpid`/`gettid`/`getuid`/`geteuid`/`getgid`/`getegid`/`getppid`);
 twenty-seven numbers in total.
 `openat` is limited to `AT_FDCWD`; every other number returns `-ENOSYS` and is
 counted, never silently ignored.
-
-An **ELF64 program-image loader** now exists (`include/hyperion/elf.hpp`,
-`src/core/elf.cpp`): `parse_elf64()` validates a header and its program headers
-against the file bounds with a distinct error per rule, and `load_elf64()` maps
-the `PT_LOAD` segments into the guest address space, zero-fills BSS, and builds
-the startup stack (argc/argv/envp/auxv) with `rsp` 16-byte aligned at entry.
-`hyperion info <elf>` describes an image read-only; `hyperion run <elf>` maps and
-runs it with the syscall layer enabled. Dynamically linked images are rejected
-with `ElfError::kNeedsInterpreter` rather than loaded and then failing later. A
-real `gcc -static` binary now loads and starts, stopping at the first
-unimplemented instruction with an honest `kUnsupported` — it does not yet run.
 
 The project also installs with a single command:
 
@@ -520,59 +440,13 @@ removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native | `scripts/dev.sh test` | 11/11 ctest passed (217 unit cases, 0 failed, 17 skipped) |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | 7/7 ctest passed (unit cases + ELF CLI under qemu) |
-| Clang | `scripts/dev.sh clang-build` | 11/11 passed |
-| ASan/UBSan | `scripts/dev.sh sanitize` | 11/11 passed |
+| Native | `scripts/dev.sh test` | 10/10 ctest passed (187 unit cases, 0 failed, 13 skipped) |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (198 unit cases, 0 failed, 2 skipped) |
+| Clang | `scripts/dev.sh clang-build` | 10/10 passed (181 unit cases, 0 failed) |
+| ASan/UBSan | `scripts/dev.sh sanitize` | 10/10 passed (181 unit cases, 0 failed) |
 | Formatting | `scripts/dev.sh format` | clean (clang-format 19.1.7) |
 | Lint | `shellcheck scripts/*.sh tests/cli/*.sh` | clean |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
-
-Re-verified after the **ELF64 loader** increment: native **11/11 ctest** (217
-unit cases, 0 failed, 17 skipped; the new `cli.elf` test included); cross
-**7/7** under `qemu-user`; clang and ASan/UBSan **11/11** each; format clean;
-shellcheck clean (now including `tests/cli/elf_test.sh`). The loader was
-exercised on a real `gcc -static` binary: `hyperion info` printed its four
-`PT_LOAD` segments correctly, and `hyperion run` loaded it at its real entry
-`0x4015c0` and stopped at `0x4015c9` (`and rsp, -16`, not yet lowered) with
-`status: unsupported` — the intended honest result, not a crash.
-
-Re-verified after the **release-packaging** increment (static tarballs + release
-workflow): native **10/10 ctest** (195 unit cases, 0 failed, 17 skipped); cross
-**216/0**, 2 skipped (of 218) under `qemu-user`; format clean; shellcheck clean
-(now including `scripts/package.sh`). The packaged artefacts were **executed**,
-not assumed: `dist/hyperion-0.1.0-x86_64-linux.tar.gz` runs natively
-(`version`, `probe`), and `dist/hyperion-0.1.0-aarch64-linux.tar.gz` was run
-under `qemu-aarch64` where `hyperion run <blob> --tier=1` reported
-`1 basic block(s) translated`, `status: ok`, `rax =0x0000000000000003` — i.e.
-the shipped AArch64 binary really executes generated code, it is not a stub.
-`sha256sum -c SHA256SUMS` verified both tarballs.
-
-Re-verified after the **ALU / INC/DEC memory-operand** increment: native
-**195/0**, 17 skipped (of 212); cross **216/0**, 2 skipped (of 218) under
-`qemu-user`; ASan/UBSan **10/10 ctest**; clang-build **10/10 ctest**; format
-clean; shellcheck clean. The generated AArch64 for the new forms was
-**executed**, not assumed: `translator.differential_alu_memory_operands`
-(read-modify-write chain plus `cmp` through memory, comparing registers, all six
-flags and the memory word against the interpreter) and
-`translator.differential_alu_memory_fault_is_reported` (an ALU store to an
-unmapped address reports `kMemoryFault` with rip on the faulting instruction)
-both run under `qemu-aarch64`. Acceptance for 15 encodings is pinned by
-`translator.translates_alu_memory_forms`, with the bytes checked against GNU
-`as`/`objdump`.
-
-Re-verified after the **MOV memory-operand** increment (soft MMU): native
-**195/0**, 15 skipped (of 210); cross **214/0**, 2 skipped (of 216) under
-`qemu-user`; ASan/UBSan **10/10 ctest**; clang-build **10/10 ctest**; format
-clean. The generated AArch64 code that calls `hyperion_load`/`hyperion_store`
-was **executed**, not assumed: `translator.differential_memory_operands` (store /
-load round trip, 32-bit forms, fault case) and
-`syscall.mmap_end_to_end_under_generated_code` run under `qemu-aarch64` and
-agree with the interpreter. Two failures found during this work were real and
-were fixed before the commit: a stale `mmap`-under-generated-code test that
-still expected `kUnsupported` (the boundary it pinned has moved), and a clang
-`-Wreturn-type-c-linkage` error on the helper struct return (the clang build
-uses `-Werror`, so CI would have failed).
 
 Re-verified after the Phase 6 tenth slice (`statx`): native **187/0**, 13
 skipped (of 200); cross **204/0**, 2 skipped (of 206) under `qemu-user`;
@@ -696,15 +570,6 @@ cases compared against real x86-64 hardware), `syscall.inventory_valid`,
 unit cases under `qemu-user`) and `syscall.inventory_valid`.
 
 ### Remote verification (GitHub Actions)
-
-CI run `39582589833` on `main` (commit `609a002`, MOV memory operands via
-soft-MMU helpers): **conclusion `success`** — all six jobs passed:
-`clang-format` (7s), `AArch64 cross tests (qemu-user)` (49s), `ASan/UBSan` (28s),
-`syscall inventory & shellcheck` (12s), `build & test (clang)` (32s),
-`build & test (gcc)` (39s). The AArch64 job is the one that executes the
-generated helper-calling code under `qemu-user` and runs
-`translator.differential_memory_operands`. Push verified with
-`git ls-remote origin main` → `609a002`.
 
 CI run `39446173442` on `main` (commit `60114c7`, Phase 6 increment 4:
 `openat` + `fstat`): **conclusion `success`** — all six jobs passed:
@@ -852,17 +717,13 @@ stable-vs-noisy discrimination case).
   rather than as a separate guest kernel. For a single-process guest this is
   indistinguishable from the truth; `gettid` in particular assumes single-threaded
   execution and must be revisited when `clone` lands.
-- **Known limitation of Tier 1 (the code generator):** it is **register-only
-  for ALU operations**. MOV through memory now works — `mov r64, [mem]`,
-  `mov [mem], r64` and the 32-bit forms lower to a soft-MMU runtime helper
-  (`hyperion_load`/`hyperion_store`), so a translated program can read and write
-  memory, and a faulting access exits the block with `kMemoryFault` rather than
-  returning a wrong value. Every *other* memory operand (an ALU read-modify-write
-  such as `add r, [m]`) is still rejected (`translator.cpp validate_body`) and
-  the block stops with `kUnsupported` rather than emitting wrong code; that is
-  the next memory increment. Each translated memory access costs a helper call
-  (guest address `A` is not host address `A`), which is a Phase 5 optimization
-  target (LIM-017).
+- **Known limitation of Tier 1 (the code generator):** it is **register-only**.
+  Any instruction with a memory operand is rejected (`translator.cpp
+  validate_body`) and the block stops with `kUnsupported` rather than emitting
+  wrong code. So Tier 1 cannot yet execute a program that loads or stores, even
+  though Tier 0 (the interpreter) can and the syscall layer now supports
+  `mmap`/`brk`. This is the single biggest gap between the tiers and the gating
+  item for real programs; it is the "next" item in §4.
 - **Open questions:**
   - The AArch64 UML port has **not** been built or run. Its build is blocked by
     a host toolchain problem that also blocks stock x86-64 UML. Not measured on
@@ -883,36 +744,11 @@ stable-vs-noisy discrimination case).
 
 ## 4. Immediate next task
 
-**Release packaging is done: static x86-64 and AArch64 tarballs build
-reproducibly (`scripts/package.sh`), a tag-triggered workflow publishes them
-with checksums, and both artefacts were executed and verified. Phase 6's tenth
-syscall slice (`statx`) is implemented and tested in both tiers. Phase 5 has six
-accepted, measured optimizations (BENCHMARKS.md §4.2.1–4.2.6). The ELF64 loader
-is done: `hyperion info`/`run <elf>` load a static image and start it (see §0f).**
+**Phase 6's tenth syscall slice (`statx`) is implemented and tested in both
+tiers. Phase 5 has six accepted, measured optimizations
+(BENCHMARKS.md §4.2.1–4.2.6), all deterministic-evidence based.**
 
-The single best next action is now a **code-generator** one, because the loader
-made the gap explicit and it is what actually blocks running a real binary:
-
-- **The guest stack (`push`/`pop`/`call`/`ret` with `rsp`).** A real static
-  binary's `_start` begins with `xor ebp,ebp; mov r9,rdx; pop rsi; mov rdx,rsp;
-  and rsp,-16; push rax; push rsp; …; call __libc_start_main`. Hyperion loads it
-  and stops at `and rsp,-16` (`0x4015c9`) — it does not lower `and r64, imm`, and
-  more importantly `pop`/`push`/`call`/`ret` do not exist yet. Implement them with
-  `rsp` as an ordinary guest register in the effective-address path (a soft-MMU
-  load/store at `rsp`, then the pointer adjust), keep the reference interpreter
-  as the oracle, and add a focused differential per form plus a whole-program
-  differential for a `call`/`ret` round trip. This is the increment that turns
-  "blocks" into "programs".
-
-Then, in parallel and also code-gen:
-
-- **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
-  rejects (`kUnsupportedOperand`). Ubiquitous in position-independent code, so
-  the biggest single decoder gap, and a small self-contained change.
-- **`and r64, imm` / the remaining ALU immediates** in the translator, which is
-  literally the instruction the real `_start` stops on.
-
-Then, larger Phase 6/7 work (independent):
+The single best next action (Phase 6, extend coverage in U4 order):
 
 - **Add the remaining U4/E1 syscalls a real program needs to start and run**:
   `arch_prctl`(158) (set up the thread-local/FS base — required before glibc
@@ -946,19 +782,13 @@ Then, independent and larger (Phase 5):
 
 Then, larger Phase 6/7 work (independent):
 
-- **Next code-generator increment (pick one).** ALU and INC/DEC memory operands
-  now work alongside MOV, all through the soft-MMU helper. The next natural
-  steps, in rough order of value:
-  - **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
-    rejects (`kUnsupportedOperand`). It is ubiquitous in real position-independent
-    code, so it is the biggest single blocker to running anything real, and it is
-    a small, self-contained decoder change plus an effective-address case.
-  - **The guest stack** (`push`/`pop`/`call`/`ret` with rsp), which is what turns
-    "blocks" into "programs"; it needs `rsp` modelled as an ordinary guest
-    register in the effective-address path.
-  - **Block chaining / cache invalidation**, the remaining Phase 4 gap.
-  Require the whole differential suite (including the memory differentials) to
-  pass before accepting, and add a focused differential per form.
+- **Memory operands in the code generator.** The AArch64 generator is
+  register-only: it rejects any instruction with a memory operand
+  (`translator.cpp validate_body`). Every real program loads and stores, so this
+  is the gating item for running anything nontrivial in Tier 1. It is the
+  natural pairing with `read`/`openat`, because a syscall result buffer is
+  written to guest memory. Until it lands, Tier 1 stops honestly at the first
+  memory operand (see the `mmap_end_to_end_..._stops_at_memory_operand` test).
 - **Extend coverage in U4 order** (`docs/syscalls/U4.md`) beyond the above:
   `getrandom`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl` (TLS setup is
   required for most dynamically linked programs).

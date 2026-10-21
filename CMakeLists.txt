@@ -1,15 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ---------------------------------------------------------------------------
-# Project HYPERION - experimental x86-64 -> AArch64 dynamic binary translator.
-#
-# Phase 0 scope: buildable, testable foundation. No instruction execution yet.
-# See ARCHITECTURE.md, ROADMAP.md and STATUS.md for the current state.
+# Project HYPERION - x86-64 -> AArch64 user-mode dynamic binary translator.
 # ---------------------------------------------------------------------------
 
 project(hyperion
-    VERSION 0.1.0
-    DESCRIPTION "Experimental x86-64 to AArch64 user-mode dynamic binary translator"
+    VERSION 0.2.0
+    DESCRIPTION "x86-64 to AArch64 user-mode dynamic binary translator for Linux ELF64 binaries"
     HOMEPAGE_URL "https://github.com/ransombiyato/hyperion-dbt"
     LANGUAGES CXX)
 
@@ -38,9 +35,6 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # --- Compiler warnings (portable across GCC and Clang) ----------------------
 add_library(hyperion_warnings INTERFACE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    # -Wsign-conversion is the flag that catches a signed index reaching
-    # vector::operator[]; clang enables it under -Wconversion but gcc does not,
-    # so without it a gcc-only host misses a bug the clang CI job rejects.
     target_compile_options(hyperion_warnings INTERFACE
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
         -Wcast-qual -Wformat=2 -Wundef -Wnon-virtual-dtor)
@@ -69,6 +63,7 @@ add_library(hyperion_core
     src/core/runtime_helpers.cpp
     src/core/address_space.cpp
     src/core/elf.cpp
+    src/core/elf_loader.cpp
     src/core/translation_cache.cpp)
 add_library(hyperion::core ALIAS hyperion_core)
 

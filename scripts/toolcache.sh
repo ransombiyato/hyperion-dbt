@@ -73,6 +73,7 @@ cache_toolchain() {
     mkdir -p "${tc_dir}"
     local tarball="${tc_dir}/aarch64-toolchain.tar.gz"
     local paths=()
+    local p
     for p in /usr/aarch64-linux-gnu /usr/lib/gcc-cross/aarch64-linux-gnu \
         /usr/bin/aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-g++ \
         /usr/bin/aarch64-linux-gnu-ld /usr/bin/aarch64-linux-gnu-as \
@@ -80,6 +81,15 @@ cache_toolchain() {
         /usr/bin/aarch64-linux-gnu-nm /usr/bin/aarch64-linux-gnu-strip; do
         [ -e "${p}" ] && paths+=("${p}")
     done
+    shopt -s nullglob
+    for p in /usr/lib/x86_64-linux-gnu/libopcodes*arm64* \
+        /usr/lib/x86_64-linux-gnu/libbfd*arm64* \
+        /usr/lib/x86_64-linux-gnu/libsframe* \
+        /usr/lib/x86_64-linux-gnu/libctf* \
+        /usr/lib/x86_64-linux-gnu/libzstd*; do
+        [ -e "${p}" ] && paths+=("${p}")
+    done
+    shopt -u nullglob
     [ ${#paths[@]} -gt 0 ] || die "no AArch64 cross toolchain found; run scripts/bootstrap.sh first"
 
     echo "  archiving ${#paths[@]} path(s) into ${tarball} ..."
@@ -111,6 +121,7 @@ restore() {
     fi
     echo "==> restoring AArch64 cross toolchain from ${tarball} (needs root)"
     ${SUDO} tar -xzf "${tarball}" -C /
+    ${SUDO} ldconfig
     echo "==> restored; verify with: aarch64-linux-gnu-g++ --version"
 }
 
@@ -132,8 +143,9 @@ install_host() {
     echo "==> installing ${#debs[@]} vendored host package(s) (needs root)"
     # --no-download prefers the local files; apt fetches only unmet dependencies.
     if ! ${SUDO} apt-get install -y --no-download "${debs[@]}"; then
-        echo "toolcache: offline install failed; retrying with the network for" >&2
-        echo "           any missing dependencies ..." >&2
+        echo "toolcache: offline install failed; refreshing package index and" >&2
+        echo "           retrying with the network for unmet dependencies ..." >&2
+        ${SUDO} apt-get update
         ${SUDO} apt-get install -y "${debs[@]}"
     fi
     echo "==> done; verify with: cmake --version && ninja --version && shellcheck --version"

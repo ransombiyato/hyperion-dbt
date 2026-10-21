@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "hyperion/bench_stats.hpp"
+#include "hyperion/exec_mem.hpp"
 #include "hyperion/host_probe.hpp"
 #include "hyperion/version.hpp"
 
@@ -205,10 +206,10 @@ int main(int argc, char** argv) {
         std::printf("    \"measurement_plausible\": %s\n",
                     measurement_plausible ? "true" : "false");
         std::printf("  },\n");
-        // Explicitly unavailable until the translator is implemented.
         std::printf("  \"guest_execution\": {\n");
-        std::printf("    \"available\": false,\n");
-        std::printf("    \"reason\": \"translator not implemented (Phase 0)\"\n");
+        std::printf("    \"tier1_native_aarch64\": %s,\n",
+                    hyperion::ExecMem::executable_supported() ? "true" : "false");
+        std::printf("    \"benchmark_driver\": \"hyperion_tier_bench\"\n");
         std::printf("  }\n");
         std::printf("}\n");
     } else {
@@ -228,7 +229,8 @@ int main(int argc, char** argv) {
                     checksum_stable ? "stable" : "UNSTABLE");
         std::printf("measurement:     %s\n",
                     measurement_plausible ? "plausible" : "IMPLAUSIBLE (workload optimised away)");
-        std::printf("guest execution: unavailable (translator not implemented)\n");
+        std::printf("guest execution: measured separately by hyperion_tier_bench (tier 1 %s)\n",
+                    hyperion::ExecMem::executable_supported() ? "active" : "cross-only");
     }
 
     // A benchmark whose checksum moved was measuring a broken build, and one

@@ -34,18 +34,23 @@
 namespace hyperion {
 
 // Page permissions, mirroring the PROT_* bits the guest passes to mprotect and
-// mmap. kNone is PROT_NONE: mapped but inaccessible.
+// mmap. kNone is PROT_NONE: mapped but inaccessible. All bitmask combinations
+// 0..7 are named explicitly so static analysis knows the full value domain.
 enum class MemPerm : std::uint8_t {
     kNone = 0,
     kRead = 1,
     kWrite = 2,
+    kReadWrite = 3,
     kExec = 4,
+    kReadExec = 5,
+    kWriteExec = 6,
+    kAll = 7,
 };
 
-inline MemPerm operator|(MemPerm a, MemPerm b) {
+constexpr MemPerm operator|(MemPerm a, MemPerm b) noexcept {
     return static_cast<MemPerm>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
 }
-inline bool has_perm(MemPerm set, MemPerm bit) {
+constexpr bool has_perm(MemPerm set, MemPerm bit) noexcept {
     return (static_cast<std::uint8_t>(set) & static_cast<std::uint8_t>(bit)) != 0;
 }
 
@@ -104,6 +109,12 @@ public:
     std::optional<std::uint64_t> map_anonymous(std::size_t size, MemPerm perm,
                                                std::uint64_t hint = 0);
 
+    // Fixed-address mapping (`MAP_FIXED` semantics): replaces any existing
+    // mappings inside `[addr, addr + align_up(size))` with a fresh zero-filled
+    // mapping carrying `perm`, optionally copying `init_len` bytes of `init_data`.
+    bool map_fixed(std::uint64_t addr, std::size_t size, MemPerm perm,
+                   const void* init_data = nullptr, std::size_t init_len = 0);
+
     // Unmap `size` bytes starting at `addr`. Returns false if the range is
     // misaligned, empty, or not fully mapped.
     bool unmap(std::uint64_t addr, std::size_t size);
@@ -118,10 +129,13 @@ public:
     // unchanged current break on failure (the kernel's contract).
     std::uint64_t set_brk(std::uint64_t requested);
 
-    // Memory interface. A read/write is served only if the entire range is
-    // mapped with sufficient permission; otherwise it fails.
+    // Memory interface. A read/write/fetch is served only if the entire range
+    // is mapped with sufficient permission; otherwise it fails.
     bool read(std::uint64_t address, std::uint8_t* out, std::size_t count) override;
     bool write(std::uint64_t address, const std::uint8_t* in, std::size_t count) override;
+    bool fetch(std::uint64_t address, std::uint8_t* out, std::size_t count) override;
+    std::uint64_t code_epoch() const noexcept override { return code_epoch_; }
+    PageAccess translate_page(std::uint64_t page_addr) noexcept override;
 
     // Diagnostics/tests.
     std::size_t region_count() const { return regions_.size(); }
@@ -146,17 +160,22 @@ private:
     // by base and non-overlapping.
     long find_region(std::uint64_t address) const;
 
-    // True if [addr, addr+size) is free of existing mappings.
+    // Split any region strictly spanning `boundary` into [base, boundary) and
+    // [boundary, end) with identical permissions and preserved bytes.
+    bool split_region_at(std::uint64_t boundary);
+
+    // True if [addr, addr+size) is free of existing mappings and the heap reservation.
     bool range_is_free(std::uint64_t addr, std::uint64_t size) const;
 
     // Ensure the heap region [heap_base_, align_up(upto)) is mapped read/write,
-    // growing the existing heap region (or creating it) as needed. Zero-fills new
-    // pages, like an anonymous mapping. Called by set_brk when the break grows.
-    void ensure_heap_mapped(std::uint64_t upto);
+    // growing the existing heap region (or creating it) while preserving all
+    // existing heap bytes and zero-filling new pages. Returns false on OOM/cap.
+    bool ensure_heap_mapped(std::uint64_t upto);
 
     // Copy in/out across possibly multiple regions, honouring `need` permission
-    // on every region the range touches. Shared by read() and write().
-    bool access(std::uint64_t address, std::uint8_t* buf, std::size_t count, bool is_write);
+    // on every region the range touches. Shared by read(), write(), and fetch().
+    bool access(std::uint64_t address, std::uint8_t* buf, std::size_t count, MemPerm need,
+                bool is_write);
 
     std::vector<Region> regions_; // sorted by base, non-overlapping
     std::uint64_t mmap_cursor_ = 0;
@@ -164,6 +183,8 @@ private:
     std::uint64_t heap_end_ = 0; // exclusive end of the reserved heap area
     std::uint64_t brk_ = 0;
     std::size_t max_map_bytes_ = kDefaultMaxMapBytes;
+    std::uint64_t code_epoch_ = 1;
+    mutable std::size_t mru_index_ = 0;
 };
 
 } // namespace hyperion

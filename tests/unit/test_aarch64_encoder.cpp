@@ -427,3 +427,44 @@ HYPERION_TEST("aarch64_encoder", "ubfx_field_overflow_is_rejected") {
     }
     HYPERION_CHECK(threw);
 }
+
+HYPERION_TEST("aarch64_encoder", "shifted_imm12_mvn_and_tbnz_match_binutils") {
+    // Verified word-for-word against GNU binutils 2.44 (aarch64-linux-gnu-as /
+    // aarch64-linux-gnu-objdump -d):
+    //   add  x0, x1, #0x1, lsl #12    -> 0x91400420
+    //   sub  w2, w3, #0xabc, lsl #12  -> 0x516af062
+    //   adds x12, x13, #0x1, lsl #12  -> 0xb14005ac
+    //   subs x14, x15, #0x2, lsl #12  -> 0xf14009ee
+    //   cmp  x6, #0x3, lsl #12        -> 0xf1400cdf
+    //   mvn  w13, w13                 -> 0x2a2d03ed
+    //   mvn  x14, x15                 -> 0xaa2f03ee
+    //   tbnz x7, #63, -4              -> 0xb7ffffe7
+    //   tbz  x7, #63, -8              -> 0xb6ffffc7
+    Encoder e;
+    e.add_imm(Width::k64, 0, 1, 1, true);
+    e.sub_imm(Width::k32, 2, 3, 0xABC, true);
+    e.adds_imm(Width::k64, 12, 13, 1, true);
+    e.subs_imm(Width::k64, 14, 15, 2, true);
+    e.cmp_imm(Width::k64, 6, 3, true);
+    e.mvn(Width::k32, 13, 13);
+    e.mvn(Width::k64, 14, 15);
+    const auto back = e.new_label();
+    e.bind(back);
+    e.nop();
+    e.tbnz(7, 63, back);
+    e.tbz(7, 63, back);
+
+    const std::vector<std::uint32_t> expected = {
+        0x91400420u, // add  x0, x1, #0x1, lsl #12
+        0x516AF062u, // sub  w2, w3, #0xabc, lsl #12
+        0xB14005ACu, // adds x12, x13, #0x1, lsl #12
+        0xF14009EEu, // subs x14, x15, #0x2, lsl #12
+        0xF1400CDFu, // cmp  x6, #0x3, lsl #12
+        0x2A2D03EDu, // mvn  w13, w13
+        0xAA2F03EEu, // mvn  x14, x15
+        0xD503201Fu, // nop
+        0xB7FFFFE7u, // tbnz x7, #63, back (-4)
+        0xB6FFFFC7u, // tbz  x7, #63, back (-8)
+    };
+    HYPERION_CHECK(e.code() == expected);
+}

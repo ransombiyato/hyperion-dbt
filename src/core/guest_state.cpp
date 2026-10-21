@@ -34,18 +34,24 @@ std::string to_string(const Flags& flags) {
 
 std::uint64_t pack_flags(const Flags& flags) {
     std::uint64_t value = kRflagsBitReserved1; // bit 1 is architecturally set
-    if (flags.cf)
+    if (flags.cf) {
         value |= kRflagsBitCf;
-    if (flags.pf)
+    }
+    if (flags.pf) {
         value |= kRflagsBitPf;
-    if (flags.af)
+    }
+    if (flags.af) {
         value |= kRflagsBitAf;
-    if (flags.zf)
+    }
+    if (flags.zf) {
         value |= kRflagsBitZf;
-    if (flags.sf)
+    }
+    if (flags.sf) {
         value |= kRflagsBitSf;
-    if (flags.of)
+    }
+    if (flags.of) {
         value |= kRflagsBitOf;
+    }
     return value;
 }
 

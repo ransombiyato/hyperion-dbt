@@ -23,7 +23,8 @@ EMULATOR="${HYPERION_EMULATOR:-}"
 
 BLOB="$(mktemp)"
 ERRFILE="$(mktemp)"
-trap 'rm -f "$BLOB" "$ERRFILE"' EXIT
+STATIC_ELF="$(mktemp)"
+trap 'rm -f "$BLOB" "$ERRFILE" "$STATIC_ELF"' EXIT
 
 # mov ecx, 5 ; add rbx, rax ; dec rcx ; jnz -5 ; hlt
 printf '\xB9\x05\x00\x00\x00\x48\x01\xC3\x48\xFF\xC9\x75\xF8\xF4' > "$BLOB"
@@ -64,3 +65,40 @@ if ! grep -q 'falling back' "$ERRFILE"; then
 else
     echo "cli smoke ok: tier 1 fell back to the interpreter, steps=$steps0"
 fi
+
+# Real static x86-64 glibc C binary verification (when static x86-64 gcc is present):
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SHA_SRC="$REPO_ROOT/benchmarks/workloads/sha256.c"
+if command -v gcc >/dev/null 2>&1 && [[ "$(uname -m)" == "x86_64" ]] && \
+   gcc -O2 -static "$SHA_SRC" -o "$STATIC_ELF" 2>/dev/null; then
+    ref_line="$("$STATIC_ELF" 4096)"
+    # shellcheck disable=SC2086
+    elf0="$($EMULATOR "$BIN" run --tier=0 "$STATIC_ELF" -- 4096 2>"$ERRFILE")"
+    # shellcheck disable=SC2086
+    elf1="$($EMULATOR "$BIN" run --tier=1 "$STATIC_ELF" -- 4096 2>"$ERRFILE")"
+    if ! grep -Fq "$ref_line" <<<"$elf0" || ! grep -Fq "$ref_line" <<<"$elf1"; then
+        echo "static ELF digest mismatch against native reference ($ref_line)" >&2
+        exit 1
+    fi
+    elf_steps0="$(grep -oE '^steps: *[0-9]+' <<<"$elf0" | grep -oE '[0-9]+')"
+    elf_steps1="$(grep -oE '^steps: *[0-9]+' <<<"$elf1" | grep -oE '[0-9]+')"
+    if [[ "$elf_steps0" != "$elf_steps1" ]]; then
+        echo "static ELF step mismatch: tier0=$elf_steps0 vs tier1=$elf_steps1" >&2
+        exit 1
+    fi
+    echo "static ELF smoke ok: $ref_line (steps=$elf_steps0)"
+fi
+
+# Real dynamically linked PT_INTERP x86-64 binary verification (ld-linux + libc):
+if [[ -x /bin/echo && -r /lib64/ld-linux-x86-64.so.2 ]]; then
+    # shellcheck disable=SC2086
+    dyn0="$($EMULATOR "$BIN" run --quiet --tier=0 /bin/echo -- "dyn-interp-ok" 2>"$ERRFILE")"
+    # shellcheck disable=SC2086
+    dyn1="$($EMULATOR "$BIN" run --quiet --tier=1 /bin/echo -- "dyn-interp-ok" 2>"$ERRFILE")"
+    if [[ "$dyn0" != "dyn-interp-ok" || "$dyn1" != "dyn-interp-ok" ]]; then
+        echo "dynamic ELF output mismatch: tier0='$dyn0' tier1='$dyn1'" >&2
+        exit 1
+    fi
+    echo "dynamic PT_INTERP ELF smoke ok: $dyn1"
+fi
+

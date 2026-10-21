@@ -22,12 +22,15 @@ from __future__ import annotations
 import argparse
 import collections
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SYSDIR = ROOT / "docs" / "syscalls"
 INVENTORY = SYSDIR / "inventory.tsv"
 KERNEL_TABLE = SYSDIR / "kernel-table-x86_64-6.12.tsv"
+SYSCALL_HPP = ROOT / "include" / "hyperion" / "syscall.hpp"
+SYSCALL_CPP = ROOT / "src" / "core" / "syscall.cpp"
 
 USAGE_TIERS = ["U4", "U3", "U2", "U1"]
 EXTRA_TIERS = ["E1", "E2", "E3"]
@@ -149,10 +152,59 @@ def validate(rows, kernel, verbose=True):
         errors.append(f"extra: syscall {nr} is in the inventory but not common/64 in the "
                       f"kernel table")
 
+    # 5. bidirectional C++ implementation sync: every `case sysno::kX:` handled
+    #    in MinimalSyscallHandler::handle() and listed in is_minimal_syscall()
+    #    must match `status != 'not-started'` in inventory.tsv.
+    if SYSCALL_HPP.exists() and SYSCALL_CPP.exists():
+        hpp_text = SYSCALL_HPP.read_text()
+        cpp_text = SYSCALL_CPP.read_text()
+        sysno_map = {
+            m.group(1): int(m.group(2))
+            for m in re.finditer(
+                r"inline\s+constexpr\s+std::uint64_t\s+(k\w+)\s*=\s*(\d+)\s*;", hpp_text
+            )
+        }
+        handle_body_match = re.search(
+            r"MinimalSyscallHandler::handle\s*\([^)]*\)\s*\{(.*?)\nbool\s+is_minimal_syscall",
+            cpp_text,
+            re.DOTALL,
+        )
+        minimal_body_match = re.search(
+            r"bool\s+is_minimal_syscall\s*\([^)]*\)\s*\{(.*?)\n\}",
+            cpp_text,
+            re.DOTALL,
+        )
+        if handle_body_match and minimal_body_match:
+            handled_syms = set(
+                re.findall(r"\bcase\s+sysno::(k\w+)\s*:", handle_body_match.group(1))
+            )
+            minimal_syms = set(
+                re.findall(r"\bsysno::(k\w+)\b", minimal_body_match.group(1))
+            )
+            for sym in sorted(handled_syms ^ minimal_syms):
+                errors.append(
+                    f"C++ sync: sysno::{sym} differs between MinimalSyscallHandler::handle() "
+                    f"and is_minimal_syscall()"
+                )
+            cpp_implemented_nrs = {sysno_map[s] for s in handled_syms if s in sysno_map}
+            tsv_implemented_nrs = {r.nr for r in rows if r.status != "not-started"}
+            for nr in sorted(cpp_implemented_nrs - tsv_implemented_nrs):
+                errors.append(
+                    f"C++ -> TSV drift: syscall {nr} ({kernel.get(nr, ('?', '?'))[1]}) is "
+                    f"handled in src/core/syscall.cpp but marked 'not-started' in inventory.tsv"
+                )
+            for nr in sorted(tsv_implemented_nrs - cpp_implemented_nrs):
+                errors.append(
+                    f"TSV -> C++ drift: syscall {nr} ({kernel.get(nr, ('?', '?'))[1]}) is "
+                    f"marked implemented in inventory.tsv but not handled in src/core/syscall.cpp"
+                )
+
     if verbose:
         counts = collections.Counter(r.tier for r in rows)
+        implemented_count = sum(1 for r in rows if r.status != "not-started")
         print(f"inventory entries : {len(rows)}")
         print(f"kernel common/64  : {len(common64)}")
+        print(f"implemented       : {implemented_count}")
         for t in ALL_TIERS:
             print(f"  {t}: {counts.get(t, 0)}")
         print(f"errors            : {len(errors)}")
@@ -221,7 +273,21 @@ def main(argv=None):
         return 1
 
     if args.check:
-        print("\nOK: inventory is complete, consistent and valid.")
+        stale = []
+        for tier in ALL_TIERS:
+            tier_rows = [r for r in rows if r.tier == tier]
+            expected = render_tier(tier, tier_rows)
+            path = SYSDIR / f"{tier}.md"
+            if not path.exists() or path.read_text() != expected:
+                stale.append(str(path.relative_to(ROOT)))
+        if stale:
+            print(
+                f"\nFAILED: generated Markdown out of date ({', '.join(stale)}); "
+                f"re-run: python3 tools/gen_syscall_inventory.py",
+                file=sys.stderr,
+            )
+            return 1
+        print("\nOK: inventory, C++ handler, and generated Markdown are complete and in sync.")
         return 0
 
     written = generate(rows)

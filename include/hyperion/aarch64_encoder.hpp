@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Project HYPERION contributors
 //
-// AArch64 instruction encoder for the Phase 3 code generator.
+// AArch64 instruction encoder for the Phase 3–7 code generator.
 //
 // Design (see DECISIONS.md D-015):
-//   - This is an *encoder*, not a disassembler: it turns a small, explicit set
-//     of AArch64 operations into their 32-bit encodings. There is no decoding
-//     path and no "close enough" output.
-//   - Encodings are verified against GNU as / objdump, not written from
-//     memory. tests/unit/test_aarch64_encoder.cpp holds the reference bytes.
-//   - Branches use labels with a fixup pass, so a caller never computes a
-//     byte offset by hand. Hand-computed offsets are a classic source of
-//     "works in the test, wrong in the field" bugs.
-//   - Only the instructions the Phase 3 translator actually emits are here.
-//     Adding an instruction requires adding a reference-verified test.
+//   - This is an *encoder*, not a disassembler: it turns an explicit set of
+//     AArch64 operations into their exact 32-bit encodings.
+//   - Every encoding is verified bit-for-bit against GNU as / objdump in
+//     tests/unit/test_aarch64_encoder.cpp.
+//   - Branches and PC-relative `ADR` use labels with a fixup pass, so a caller
+//     never computes a byte offset by hand.
 #ifndef HYPERION_AARCH64_ENCODER_HPP
 #define HYPERION_AARCH64_ENCODER_HPP
 
@@ -24,15 +20,11 @@
 
 namespace hyperion::a64 {
 
-// AArch64 general-purpose register numbers, as used in encodings. X0..X30 are
-// the GPRs; 31 means XZR (or SP in some contexts, which this encoder avoids by
-// never treating 31 as SP).
 using Reg = unsigned;
 constexpr Reg kXzr = 31;
 constexpr Reg kLr = 30;
 constexpr Reg kSp = 31;
 
-// Condition codes (the low nibble of B.cond).
 enum class Cond : std::uint8_t {
     kEq = 0x0,
     kNe = 0x1,
@@ -54,131 +46,136 @@ enum class Cond : std::uint8_t {
 
 const char* to_string(Cond c);
 
-// Operand width selector for the data-processing instructions here.
 enum class Width : std::uint8_t { k32, k64 };
 
-// Shift selector for the shifted-register forms of the logical instructions.
 enum class Shift : std::uint8_t { kLsl = 0, kLsr = 1, kAsr = 2, kRor = 3 };
 
 using Label = std::size_t;
 
-// An in-memory sequence of AArch64 instructions with label-based branches.
 class Encoder {
 public:
     // --- data processing (register) -------------------------------------
     void add(Width w, Reg rd, Reg rn, Reg rm);
-    void sub(Width w, Reg rd, Reg rn, Reg rm);
-    // ADD/SUB with a shifted register: Rd = Rn +/- (Rm shifted by `amount`).
-    // Used to form a memory effective address (index*scale) without a separate
-    // shift instruction.
     void add_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount);
+    void sub(Width w, Reg rd, Reg rn, Reg rm);
     void sub_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount);
     void and_(Width w, Reg rd, Reg rn, Reg rm);
     void orr(Width w, Reg rd, Reg rn, Reg rm);
     void eor(Width w, Reg rd, Reg rn, Reg rm);
-    // EOR with a shifted register: Rd = Rn ^ (Rm shifted by `amount`).
-    // The shift amount is 0..31 for 32-bit and 0..63 for 64-bit operands.
     void eor_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount);
 
+    // --- variable register shifts & rotates -----------------------------
+    void lsl_reg(Width w, Reg rd, Reg rn, Reg rm);
+    void lsr_reg(Width w, Reg rd, Reg rn, Reg rm);
+    void asr_reg(Width w, Reg rd, Reg rn, Reg rm);
+    void ror_reg(Width w, Reg rd, Reg rn, Reg rm);
+
+    // --- multiply (32/64-bit low + 64x64->128 high half) ----------------
+    void mul(Width w, Reg rd, Reg rn, Reg rm);
+    void smulh(Reg rd, Reg rn, Reg rm);
+    void umulh(Reg rd, Reg rn, Reg rm);
+
     // --- data processing (immediate) ------------------------------------
-    // ADD/SUB with a 12-bit unsigned immediate, optionally shifted left by 12.
     void add_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12, bool shift12 = false);
     void sub_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12, bool shift12 = false);
 
     // --- comparisons (set NZCV) -----------------------------------------
-    // CMP is SUBS with the destination discarded, so it writes flags and no
-    // register. This is how the x86 CMP and the flag-producing x86 ALU ops
-    // will be lowered.
     void cmp(Width w, Reg rn, Reg rm);
     void cmp_imm(Width w, Reg rn, std::uint32_t imm12, bool shift12 = false);
 
     // --- flag-setting arithmetic (ADDS/SUBS) -----------------------------
-    // The x86 ALU flags are derived from these: ADDS/SUBS set N,Z,C,V in the
-    // AArch64 condition flags, and the translator reads them back with CSET.
     void adds(Width w, Reg rd, Reg rn, Reg rm);
     void subs(Width w, Reg rd, Reg rn, Reg rm);
-    void adds_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12);
-    void subs_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12);
+    void adds_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12, bool shift12 = false);
+    void subs_imm(Width w, Reg rd, Reg rn, std::uint32_t imm12, bool shift12 = false);
 
-    // --- conditional set (CSINC alias) -----------------------------------
-    // CSET Rd, cond  ->  Rd = (cond ? 1 : 0). Used to materialise x86 flags.
+    // Bitwise NOT / bit-reverse / byte-reverse / count leading zeros.
+    void mvn(Width w, Reg rd, Reg rm);
+    void rev(Width w, Reg rd, Reg rn);
+    void rbit(Width w, Reg rd, Reg rn);
+    void clz(Width w, Reg rd, Reg rn);
+
+    // --- conditional set & select ---------------------------------------
     void cset(Width w, Reg rd, Cond c);
+    void csel(Width w, Reg rd, Reg rn, Reg rm, Cond c);
 
-    // --- bitfield (UBFM aliases) -----------------------------------------
-    // LSR Rd, Rn, #shift. UBFX Rd, Rn, #lsb, #width (extract a bit field).
+    // --- bitfield & immediate shifts/rotates -----------------------------
+    void lsl_imm(Width w, Reg rd, Reg rn, unsigned shift);
     void lsr_imm(Width w, Reg rd, Reg rn, unsigned shift);
+    void asr_imm(Width w, Reg rd, Reg rn, unsigned shift);
+    void ror_imm(Width w, Reg rd, Reg rn, unsigned shift);
     void ubfx(Width w, Reg rd, Reg rn, unsigned lsb, unsigned width);
+    void sbfx(Width w, Reg rd, Reg rn, unsigned lsb, unsigned width);
+    void bfi(Width w, Reg rd, Reg rn, unsigned lsb, unsigned width);
 
-    // --- loads/stores (unsigned offset, scaled by access size) -----------
-    // LDR/STR for 32- and 64-bit access, LDRB/STRB for 8-bit. `byte_offset`
-    // must be a non-negative multiple of the access size, at most 4095*size.
-    // These are how generated code reads and writes GuestState.
+    // --- loads/stores (unsigned immediate offset, scaled) ----------------
     void ldr(Width w, Reg rt, Reg rn, unsigned byte_offset);
     void str(Width w, Reg rt, Reg rn, unsigned byte_offset);
+    void ldrh(Reg rt, Reg rn, unsigned byte_offset);
+    void strh(Reg rt, Reg rn, unsigned byte_offset);
     void ldrb(Reg rt, Reg rn, unsigned byte_offset);
     void strb(Reg rt, Reg rn, unsigned byte_offset);
 
+    // --- loads/stores (unscaled 64-bit register offset `[Xn, Xm]`) -------
+    // `bytes` must be 1, 2, 4, or 8; loads zero-extend into `rt`.
+    void ldr_reg_sized(unsigned bytes, Reg rt, Reg rn, Reg rm);
+    void str_reg_sized(unsigned bytes, Reg rt, Reg rn, Reg rm);
+
     // --- load/store pair (64-bit) ----------------------------------------
-    // Used to save and restore callee-saved host registers around a block.
-    // `offset` is the signed immediate (a multiple of 8 in [-512, 504]).
-    //   *_off:  signed offset, no writeback (e.g. `stp x21, x22, [sp, #16]`)
-    //   stp_pre: pre-index writeback        (e.g. `stp x19, x20, [sp, #-32]!`)
-    //   ldp_post: post-index writeback      (e.g. `ldp x19, x20, [sp], #32`)
     void stp_off(Reg rt, Reg rt2, Reg rn, int offset);
     void ldp_off(Reg rt, Reg rt2, Reg rn, int offset);
     void stp_pre(Reg rt, Reg rt2, Reg rn, int offset);
     void ldp_post(Reg rt, Reg rt2, Reg rn, int offset);
 
-    // --- moves -----------------------------------------------------------
-    // Register move, as an ORR with the zero register (the canonical MOV
-    // alias). A 32-bit move zero-extends into the 64-bit register, matching
-    // x86-64's 32-bit write rule.
+    // --- moves & PC-relative addressing ----------------------------------
     void mov_reg(Width w, Reg rd, Reg rm);
     void movz(Width w, Reg rd, std::uint16_t imm16, unsigned shift = 0);
     void movk(Width w, Reg rd, std::uint16_t imm16, unsigned shift = 0);
-    // Materialise a full 64-bit constant with a movz/movk sequence. Always
-    // emits the minimal number of instructions (skipping all-zero halfwords
-    // after the first set one).
     void mov_imm64(Reg rd, std::uint64_t value);
+    void adr(Reg rd, Label target);
 
-    // --- branches --------------------------------------------------------
-    // Unconditional B and conditional B.cond to a label.
+    // --- branches & calls ------------------------------------------------
     void b(Label target);
     void b_cond(Cond c, Label target);
-    // Compare-and-branch on a register being non-zero (CBNZ), used to test a
-    // runtime helper's fault flag without a separate CMP.
-    void cbnz(Reg rt, Label target);
-    // Branch to the address in `rn`. `blr` additionally writes the return
-    // address into X30 (LR), so generated code can call a runtime helper.
-    void br(Reg rn);
+    void cbz(Width w, Reg rt, Label target);
+    void cbnz(Width w, Reg rt, Label target);
+    void cbnz(Reg rt, Label target) { cbnz(Width::k64, rt, target); }
+    void tbz(Reg rt, unsigned bit, Label target);
+    void tbnz(Reg rt, unsigned bit, Label target);
     void blr(Reg rn);
+    void br(Reg rn);
     void ret(Reg rn = kLr);
     void nop();
+
+    // Emit raw 32-bit word (used for 8-byte-aligned read-only literal pools).
+    void emit_raw_u32(std::uint32_t word);
+
+    static std::uint32_t encode_b(std::int64_t delta_bytes);
 
     // --- labels ----------------------------------------------------------
     Label new_label();
     void bind(Label label);
 
     // --- output ----------------------------------------------------------
-    std::size_t count() const { return code_.size(); } // instructions emitted
+    std::size_t count() const { return code_.size(); }
     std::size_t byte_size() const { return code_.size() * 4; }
     const std::vector<std::uint32_t>& code() const { return code_; }
-    // Encoded bytes in little-endian order (AArch64 is little-endian here).
     std::vector<std::uint8_t> bytes() const;
 
 private:
+    enum class BranchKind : std::uint8_t { kUncond, kCond, kTestBit, kAdr };
+
     void emit(std::uint32_t word);
     void check_label(Label label) const;
-    void resolve_patch(std::size_t at, std::size_t target, bool conditional);
+    void resolve_patch(std::size_t at, std::size_t target, BranchKind kind);
     bool has_unresolved_labels() const;
 
     std::vector<std::uint32_t> code_;
-    // label id -> instruction index; kUnbound until bind() is called.
     std::vector<std::size_t> label_pos_;
     struct Fixup {
-        std::size_t at;   // instruction index of the branch (kUnbound once patched)
-        Label target;     // label it points at
-        bool conditional; // B vs B.cond (different immediate width)
+        std::size_t at;
+        Label target;
+        BranchKind kind;
     };
     std::vector<Fixup> fixups_;
 };

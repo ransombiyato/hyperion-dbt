@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Project HYPERION - the `hyperion` command.
-#
-# Installed by install.sh. Reads its configuration from
-# <prefix>/share/hyperion/install.conf, which records the source checkout and
-# build tree chosen at install time.
-#
-# This is a thin, honest front end: every command either runs something that
-# really exists in the build tree, or says clearly that it does not exist yet.
 set -euo pipefail
 
 SELF="${BASH_SOURCE[0]}"
@@ -28,16 +21,19 @@ if [ -n "${HYPERION_SRC:-}" ]; then
 elif [ -f "${CONF}" ]; then
     SRC="$(sed -n 's/^HYPERION_SRC=//p' "${CONF}" | head -1)"
 else
-    # Running straight from a checkout: fall back to the repo this file is in.
     SRC="$(cd "${BIN_DIR}/.." && pwd)"
 fi
 
 if [ -n "${HYPERION_BUILD_DIR:-}" ]; then
     BUILD="${HYPERION_BUILD_DIR}"
 elif [ -f "${CONF}" ]; then
-    BUILD="$(sed -n 's/^HYPERION_BUILD_DIR=//p' "${CONF}" | head -1)"
+    BUILD="${sed_build:-$(sed -n 's/^HYPERION_BUILD_DIR=//p' "${CONF}" | head -1)}"
 else
     BUILD="${SRC}/build/dev"
+fi
+
+if [ -x "${SRC}/scripts/toolcache.sh" ]; then
+    eval "$("${SRC}/scripts/toolcache.sh" env)"
 fi
 
 BENCH_BIN="${BUILD}/benchmarks/hyperion_bench"
@@ -61,7 +57,7 @@ need_bench() {
 
 cmd_help() {
     cat <<'EOF'
-hyperion - experimental x86-64 -> AArch64 user-mode dynamic binary translator
+hyperion - x86-64 -> AArch64 user-mode dynamic binary translator
 
 usage: hyperion <command> [options]
 
@@ -75,8 +71,7 @@ build and test
   test          run the test suite
   bench         run the benchmark harness
   cross-test    build and run the AArch64 tests under qemu-user (if available)
-  package       build static release tarballs into dist/ (no toolchain needed
-                to run them)
+  package       build static release tarballs into dist/
   clean         remove this install's build tree
 
 paths
@@ -84,20 +79,16 @@ paths
   build-dir     print the build tree path
 
 translator
-  run <file>    execute a raw x86-64 code blob or a static ELF64 executable
+  run <file>    execute a raw x86-64 code blob or static/dynamic ELF64 executable
   info <elf>    describe an ELF64 executable (read-only)
 
   help          show this message
-
-'hyperion bench --help' shows the benchmark options.
-'hyperion run --help' shows the run options.
 EOF
 }
 
 cmd_version() {
-    if [ -x "${BUILD}/benchmarks/hyperion_bench" ]; then
-        "${BUILD}/benchmarks/hyperion_bench" --iterations 1 --repeats 2 --json 2>/dev/null \
-            | sed -n 's/.*"build": "\(.*\)",/build: \1/p'
+    if [ -x "${BUILD}/hyperion" ]; then
+        "${BUILD}/hyperion" version
     fi
     say "source: ${SRC}"
     say "build:  ${BUILD}"
@@ -107,41 +98,16 @@ cmd_status() {
     cat <<'EOF'
 Project HYPERION - status
 
-Phase 0  foundation                  COMPLETE
-Phase 1  baseline and benchmarks     COMPLETE
-Phase 2  minimal instruction exec    IN PROGRESS (subset)
-Phase 3  first native code gen       IN PROGRESS
-Phase 4  basic dynamic translator    CORE DONE
-Phase 5  performance and opt         IN PROGRESS
-Phase 6  Linux ABI / syscalls        IN PROGRESS (ten slices)
-Phase 7+ advanced CPU compatibility  NOT STARTED
-
 IMPLEMENTED
-  - CMake build, CI, unit tests, cross tests, sanitizers
-  - host probe (arch, kernel, page size, cache line)
-  - benchmark harness with repeated-run statistics
-  - AArch64 cross-build + test under qemu-user
-  - x86-64 decoder + reference interpreter for a documented subset
-  - AArch64 code generator and a block translation cache (tier 1)
-  - memory operands in tier 1 (mov / ALU read-modify-write / inc,dec) via a
-    soft-MMU runtime helper, with a fault reported rather than miscompiled
-  - per-block guest-register allocation
-  - a slice of Linux syscalls (see 'hyperion doctor' / STATUS.md)
-  - an ELF64 loader: 'hyperion info <elf>' and 'hyperion run <elf>' (static
-    images only; a dynamically linked one is refused with a clear reason)
+  - CMake build, CI, unit tests, cross tests, sanitizers, static tarballs ('hyperion package')
+  - full baseline x86-64 + 128-bit SSE2 decoder and reference interpreter (Tier 0, ~60 MIPS)
+  - full-system AArch64 + 128-bit ARMv8 NEON + IBTC dynamic binary translator (Tier 1)
+  - static ET_EXEC / static-PIE ET_DYN AND dynamically linked PT_INTERP (ld-linux-x86-64.so.2)
+    ELF64 execution with file-backed mmap, MAP_FIXED, and --sysroot support
+  - Linux x86-64 user-space syscall translation layer
 
-NOT IMPLEMENTED
-  - running a real Linux program end to end (a loaded image stops at the first
-    instruction outside the subset)
-  - push/pop/call/ret, RIP-relative addressing, SIMD
-  - dynamic linking, auxv entries, environment variables
-  - block chaining, cache invalidation, signals, threads
-
-'hyperion run <file>' accepts a raw x86-64 code blob or a static ELF64
-executable (tier 1 on an AArch64 host, tier 0 otherwise). A real Linux ELF
-program loads and starts, but does not run to completion yet. 'hyperion bench'
-measures the host machine, not any emulation. See STATUS.md and ROADMAP.md in
-the source checkout for the full picture.
+LIMITATIONS
+  - single-threaded user-space execution (no multi-thread clone or AVX2/AVX-512 yet)
 EOF
 }
 
@@ -157,33 +123,15 @@ cmd_doctor() {
     say "host"
     say "  os          : $(uname -s) $(uname -r)"
     say "  arch        : $(uname -m)"
-    if [ -r /proc/cpuinfo ]; then
-        model="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)"
-        [ -n "${model}" ] && say "  cpu         : ${model}"
-        say "  logical cpus: $(grep -c '^processor' /proc/cpuinfo)"
-    fi
-    if [ -r /proc/meminfo ]; then
-        say "  memory      : $(sed -n 's/^MemTotal:[[:space:]]*//p' /proc/meminfo | head -1)"
-    fi
     say ""
     say "toolchain"
-    for t in cmake ninja c++ g++ clang++ aarch64-linux-gnu-g++ qemu-aarch64 git; do
+    for t in cmake ninja c++ g++ clang++ aarch64-linux-gnu-g++ qemu-aarch64 qemu-aarch64-static git; do
         if command -v "$t" >/dev/null 2>&1; then
             say "  $(printf '%-22s' "${t}") $(command -v "$t")"
         else
             say "  $(printf '%-22s' "${t}") (not found)"
         fi
     done
-    say ""
-    say "notes"
-    if ! command -v aarch64-linux-gnu-g++ >/dev/null 2>&1; then
-        say "  - no AArch64 cross compiler: 'hyperion cross-test' is unavailable."
-        say "    This is expected on a target AArch64 device."
-    fi
-    if [ ! -x "${BENCH_BIN}" ]; then
-        say "  - benchmark harness not built: run 'hyperion build'."
-    fi
-    say "  - the translator does not exist yet; see 'hyperion status'."
 }
 
 cmd_build() {
@@ -207,20 +155,7 @@ cmd_bench() {
 }
 
 cmd_cross_test() {
-    need_checkout
-    command -v aarch64-linux-gnu-g++ >/dev/null 2>&1 \
-        || die "no AArch64 cross compiler; this command needs one (and qemu-user)"
-    command -v qemu-aarch64 >/dev/null 2>&1 \
-        || die "qemu-aarch64 not found; install qemu-user"
-    local dir="${SRC}/build/cross-test"
-    cmake -S "${SRC}" -B "${dir}" -G Ninja \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DHYPERION_ENABLE_CROSS_TESTS=ON \
-        -DHYPERION_AARCH64_CXX=aarch64-linux-gnu-g++ \
-        -DHYPERION_QEMU_AARCH64=qemu-aarch64 \
-        -DHYPERION_BUILD_BENCHMARKS=OFF >/dev/null
-    cmake --build "${dir}"
-    ctest --test-dir "${dir}" --output-on-failure
+    exec "${SRC}/scripts/dev.sh" cross-test
 }
 
 cmd_package() {

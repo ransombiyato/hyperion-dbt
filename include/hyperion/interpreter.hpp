@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Project HYPERION contributors
 //
-// Reference interpreter for the Phase 2 instruction subset.
-//
-// This is the project's correctness oracle. It is written for clarity and
-// exactness, not speed: Phase 3's AArch64 code generator is validated by
-// comparing its results against this interpreter, so a subtle bug here would
-// be replicated into the generated code. Where x86-64 semantics are
-// surprising (32-bit writes zero-extending to 64 bits, INC/DEC preserving CF,
-// AND/OR/XOR clearing CF and OF), the code states the rule explicitly.
+// Reference interpreter and shared software-TLB contract.
 #ifndef HYPERION_INTERPRETER_HPP
 #define HYPERION_INTERPRETER_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -23,32 +18,83 @@
 
 namespace hyperion {
 
-// Abstract guest memory. The interpreter never touches host memory directly,
-// so tests can supply a bounded flat region, and later a real address space
-// can be layered underneath without changing the interpreter.
+// Result of resolving one 4 KiB guest page (`page_addr` aligned to 4096 bytes)
+// for software-TLB acceleration. Implementations that cannot expose contiguous
+// host storage (or mock fault-injection `Memory` subclasses in tests) leave
+// `host_page = nullptr`, cleanly forcing all accesses through virtual read/write.
+struct PageAccess {
+    std::uint8_t* host_page = nullptr;
+    bool can_read = false;
+    bool can_write_fast = false; // writable AND NOT executable (preserves SMC coherence)
+};
+
+// Direct-mapped software-TLB entry shared by Tier 0 and Tier 1 inline codegen.
+// Invariant: for slot `k = (addr >> 12) & (kSoftTlbEntries - 1)`:
+//   - Valid entry has `page_tag == (addr & ~0xFFFULL)` and
+//     `host_addend == uintptr_t(host_page) - page_tag` (mod 2^64).
+//   - Invalid/empty entry has `page_tag == empty_soft_tlb_tag(k)`, whose bit 12
+//     differs from `k & 1` and bits 11..0 are 0, guaranteeing unsigned
+//     `(addr - page_tag) >= 4096` across all 2^64 guest addresses with zero false hits.
+inline constexpr std::size_t kSoftTlbBits = 9;
+inline constexpr std::size_t kSoftTlbEntries = std::size_t{1} << kSoftTlbBits; // 512 pages (2 MiB)
+inline constexpr std::size_t kSoftTlbMask = kSoftTlbEntries - 1;
+
+struct SoftTlbEntry {
+    std::uint64_t page_tag = 0;
+    std::uint64_t host_addend = 0;
+};
+static_assert(sizeof(SoftTlbEntry) == 16, "Tier 1 inline AArch64 SoftTLB uses lsl #4 indexing");
+
+constexpr std::uint64_t empty_soft_tlb_tag(std::size_t slot) noexcept {
+    return ((static_cast<std::uint64_t>(slot) ^ 1ULL) << 12) | (1ULL << 63);
+}
+
+struct SoftTlb {
+    std::array<SoftTlbEntry, kSoftTlbEntries> read_entries{};
+    std::array<SoftTlbEntry, kSoftTlbEntries> write_entries{};
+    std::uint64_t epoch = 0;
+
+    SoftTlb() noexcept { flush(0); }
+
+    void flush(std::uint64_t new_epoch) noexcept {
+        for (std::size_t i = 0; i < kSoftTlbEntries; ++i) {
+            const std::uint64_t tag = empty_soft_tlb_tag(i);
+            read_entries[i] = SoftTlbEntry{tag, 0};
+            write_entries[i] = SoftTlbEntry{tag, 0};
+        }
+        epoch = new_epoch;
+    }
+};
+
+// Abstract guest memory.
 class Memory {
 public:
     virtual ~Memory() = default;
-    // Return false on an unmapped/invalid access. Implementations must not
-    // read or write out of bounds.
     virtual bool read(std::uint64_t address, std::uint8_t* out, std::size_t count) = 0;
     virtual bool write(std::uint64_t address, const std::uint8_t* in, std::size_t count) = 0;
+    virtual bool fetch(std::uint64_t address, std::uint8_t* out, std::size_t count) {
+        return read(address, out, count);
+    }
+    virtual std::uint64_t code_epoch() const noexcept { return 0; }
+    virtual PageAccess translate_page(std::uint64_t page_addr) noexcept {
+        (void)page_addr;
+        return {};
+    }
 };
 
-// A flat, byte-addressable region [base, base + size). Used by tests and by
-// the differential harness. Accesses outside the region fault rather than
-// silently reading zeros.
+// A flat, byte-addressable region [base, base + size).
 class FlatMemory final : public Memory {
 public:
     FlatMemory(std::uint64_t base, std::size_t size);
 
     bool read(std::uint64_t address, std::uint8_t* out, std::size_t count) override;
     bool write(std::uint64_t address, const std::uint8_t* in, std::size_t count) override;
+    std::uint64_t code_epoch() const noexcept override { return epoch_; }
+    PageAccess translate_page(std::uint64_t page_addr) noexcept override;
 
     std::uint64_t base() const { return base_; }
     std::size_t size() const { return bytes_.size(); }
 
-    // Direct access for test setup and inspection. Callers must stay in range.
     std::uint8_t* data() { return bytes_.data(); }
     const std::uint8_t* data() const { return bytes_.data(); }
 
@@ -57,13 +103,14 @@ private:
 
     std::uint64_t base_;
     std::vector<std::uint8_t> bytes_;
+    std::uint64_t epoch_ = 1;
 };
 
-enum class StepStatus {
+enum class StepStatus : std::uint8_t {
     kOk,          // one instruction executed; state updated
-    kHalted,      // HLT executed, or a syscall asked the guest to exit
-    kFault,       // memory fault or invalid state
-    kUnsupported, // decode failed: the instruction is not in the subset
+    kHalted,      // HLT/top-level RET executed, or exit syscall reached
+    kFault,       // memory fault, divide fault, or invalid state
+    kUnsupported, // decode failed: instruction is outside the subset
 };
 
 struct StepResult {
@@ -71,69 +118,57 @@ struct StepResult {
     DecodeError decode_error = DecodeError::kNone;
     Instruction instruction{};
     std::string message;
-    // Number of guest syscalls in this step that the handler did not implement
-    // (0 or 1). Non-zero means rax was set to -ENOSYS; execution continued.
     std::uint32_t unimplemented_syscalls = 0;
+    bool exited_via_syscall = false;
+    std::int64_t exit_code = 0;
 
     bool ok() const { return status == StepStatus::kOk; }
 };
 
 class SyscallHandler;
 
-// Execute exactly one instruction at state.rip. On kOk the state is fully
-// updated, including rip. On kUnsupported the state is unchanged, so a caller
-// can stop cleanly at the first unknown instruction rather than run past it.
-//
-// `syscalls` handles the guest `syscall` instruction. If it is null, a guest
-// syscall stops the program with kUnsupported rather than being ignored: an
-// unimplemented syscall must never look like success. On a syscall that asks
-// the guest to exit, the result is kHalted.
 StepResult step(GuestState& state, Memory& memory, SyscallHandler* syscalls = nullptr);
 
-// ALU helpers, exposed for the interpreter's tests and for the Phase 3 code
-// generator's differential checks. `width` is 32 or 64 bits.
 namespace alu {
 
-// Add/subtract with full flag computation, operating at `width` bits. The
-// returned value is the truncated result (not yet zero-extended).
 std::uint64_t add(std::uint64_t a, std::uint64_t b, int width, Flags& flags);
+std::uint64_t adc(std::uint64_t a, std::uint64_t b, bool cf_in, int width, Flags& flags);
 std::uint64_t sub(std::uint64_t a, std::uint64_t b, int width, Flags& flags);
+std::uint64_t sbb(std::uint64_t a, std::uint64_t b, bool cf_in, int width, Flags& flags);
 
-// Logical ops: CF and OF are cleared; AF is cleared (undefined on real
-// hardware, and this project models it as 0 for determinism); SF/ZF/PF from
-// the result.
 std::uint64_t logical_and(std::uint64_t a, std::uint64_t b, int width, Flags& flags);
 std::uint64_t logical_or(std::uint64_t a, std::uint64_t b, int width, Flags& flags);
 std::uint64_t logical_xor(std::uint64_t a, std::uint64_t b, int width, Flags& flags);
 
-// INC/DEC behave like ADD/SUB of 1 except that CF is preserved.
 std::uint64_t inc(std::uint64_t a, int width, Flags& flags);
 std::uint64_t dec(std::uint64_t a, int width, Flags& flags);
 
-// Evaluate a condition code against the flags. Exposed so the interpreter and
-// the code generator can share one definition of "jle".
 bool evaluate(Condition condition, const Flags& flags);
-
-// Set SF/ZF/PF from a result of the given width.
 void set_szp(std::uint64_t result, int width, Flags& flags);
 
 } // namespace alu
 
-// Result of running a program image to completion. (Defined in run.hpp and
-// shared with the Tier 1 translator.)
-//
-// Run `code` placed at `base` until the program halts (HLT/RET), an error
-// occurs, or `max_steps` is exceeded. This is a convenience layer over step();
-// it adds no new semantics, but it makes multi-instruction programs (with
-// branches and loops) testable.
-//
-// `max_steps` is mandatory-by-default (not unbounded): a guest program that
-// never halts must be reported as such, not hang the test suite. Callers that
-// genuinely want an unbounded run can pass a very large value, but the default
-// protects the tests.
-//
-// `syscalls` is threaded through to step(); when it is null a guest syscall
-// stops the program with RunStatus::kUnsupported.
+// Execute a packed SSE2 operation (`insn.opcode == Opcode::kSse`) against `state`
+// and `memory` (using `tlb` when non-null). Shared by Tier 0 and Tier 1 so complex
+// SIMD lane semantics exist in one exact implementation. Returns false on memory fault.
+bool execute_sse_instruction(const Instruction& insn, GuestState& state, Memory& memory,
+                             SoftTlb* tlb = nullptr);
+
+// Execute a `REP` / non-`REP` string instruction (`Opcode::kStringOp`) against
+// `state` and `memory`. Shared by Tier 0 and Tier 1. Returns false on memory fault.
+bool execute_string_instruction(const Instruction& insn, GuestState& state, Memory& memory,
+                                SoftTlb* tlb = nullptr);
+
+// Populate baseline x86-64 + SSE2 CPUID result in `state` for `EAX`/`ECX` inputs.
+void execute_cpuid(GuestState& state) noexcept;
+
+bool soft_tlb_read_slow(Memory& memory, SoftTlb& tlb, std::uint64_t addr, void* out,
+                        std::size_t bytes) noexcept;
+bool soft_tlb_write_slow(Memory& memory, SoftTlb& tlb, std::uint64_t addr, const void* in,
+                         std::size_t bytes) noexcept;
+bool execute_cached_helper(const Instruction& insn, GuestState& state, Memory& memory,
+                           SoftTlb* tlb = nullptr);
+
 RunResult run_program(Memory& memory, GuestState state, std::uint64_t max_steps = 1'000'000,
                       SyscallHandler* syscalls = nullptr);
 

@@ -58,6 +58,36 @@ private:
     bool finalized_ = false;
 };
 
+// Reusable W^X arena for translated basic blocks. Allocates multi-page slabs
+// once instead of calling mmap/mprotect per 64-byte basic block, switching the
+// active slab RW only during `allocate()` and immediately restoring RX +
+// I-cache coherency over the newly written slice before returning.
+class ExecArena {
+public:
+    explicit ExecArena(std::size_t slab_bytes = 64ULL * 1024ULL);
+    ~ExecArena();
+    ExecArena(const ExecArena&) = delete;
+    ExecArena& operator=(const ExecArena&) = delete;
+
+    // Copy `size` bytes (4-byte aligned) into RX memory and return entry ptr.
+    void* allocate(const std::uint8_t* code, std::size_t size);
+
+    // Drop all live allocations and reuse the first slab on subsequent runs.
+    void reset() noexcept;
+
+private:
+    struct Slab {
+        std::uint8_t* base = nullptr;
+        std::size_t capacity = 0;
+        std::size_t used = 0;
+    };
+
+    std::size_t slab_bytes_ = 0;
+    Slab* slabs_ = nullptr;
+    std::size_t slab_count_ = 0;
+    std::size_t slab_cap_ = 0;
+};
+
 } // namespace hyperion
 
 #endif // HYPERION_EXEC_MEM_HPP

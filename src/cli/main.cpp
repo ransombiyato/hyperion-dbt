@@ -3,15 +3,11 @@
 //
 // HYPERION command-line entry point.
 //
-// `version` and `probe` inspect the host, `info` describes an ELF image, and
-// `run` executes guest code through one of the two execution tiers: the Tier 0
-// reference interpreter, or the Tier 1 AArch64 translator. The two must agree;
-// `run --tier=0` and `--tier=1` are how that agreement is checked by hand.
-//
-// `run` accepts either a raw x86-64 code blob (loaded at 0x400000, as before) or
-// an ELF64 executable, which is detected by its magic. An ELF image is mapped
-// into a guest address space and its startup stack is built, so the syscall
-// layer is enabled; a raw blob keeps the old flat-memory behaviour.
+// Supports raw x86-64 code blobs as well as static (`ET_EXEC` / `ET_DYN`) and
+// dynamically linked (`PT_INTERP` e.g. `ld-linux-x86-64.so.2`) Linux x86-64
+// ELF64 executables across both execution tiers:
+//   - Tier 0: Fast decoded-ICache + SoftTlb reference interpreter
+//   - Tier 1: Full-system AArch64 + 128-bit ARMv8 NEON + IBTC JIT
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +16,7 @@
 
 #include "hyperion/address_space.hpp"
 #include "hyperion/elf.hpp"
+#include "hyperion/elf_loader.hpp"
 #include "hyperion/exec_mem.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/host_probe.hpp"
@@ -28,37 +25,35 @@
 #include "hyperion/translation_cache.hpp"
 #include "hyperion/version.hpp"
 
+extern char** environ;
+
 namespace {
 
 constexpr std::uint64_t kLoadBase = 0x400000;
-// The blob is loaded into a page-sized region so that a translation window
-// (and, later, reads past the end of a short blob) stays inside the mapped
-// region instead of faulting on the last instruction.
 constexpr std::size_t kMemSize = 4096;
-constexpr std::uint64_t kDefaultMaxSteps = 1'000'000;
+constexpr std::uint64_t kDefaultBlobMaxSteps = 1'000'000ULL;
+constexpr std::uint64_t kDefaultElfMaxSteps = 1'000'000'000ULL;
 
 void print_usage(const char* argv0) {
-    std::printf("hyperion - experimental x86-64 to AArch64 dynamic binary translator\n"
-                "\n"
-                "usage: %s <command> [options]\n"
-                "\n"
-                "commands:\n"
-                "  version      print version and build identity\n"
-                "  probe        probe and report host capabilities\n"
-                "  info <elf>   describe an ELF64 executable (no execution)\n"
-                "  run <file>   execute a raw x86-64 code blob or an ELF executable\n"
-                "  help         show this message\n"
-                "\n"
-                "run options:\n"
-                "  --tier=0|1     execution tier: 0 = reference interpreter,\n"
-                "                 1 = AArch64 translator (default 1)\n"
-                "  --max-steps=N  guest instruction limit (default %llu)\n"
-                "  --dump         print the final register state\n"
-                "\n"
-                "note: the guest subset is small (see COMPATIBILITY.md). A raw blob is\n"
-                "      loaded at 0x400000 with rip at its first byte; an ELF image is\n"
-                "      mapped from its program headers.\n",
-                argv0, static_cast<unsigned long long>(kDefaultMaxSteps));
+    std::printf(
+        "hyperion - x86-64 to AArch64 user-mode dynamic binary translator\n"
+        "\n"
+        "usage: %s <command> [options] <file> [-- guest-args...]\n"
+        "\n"
+        "commands:\n"
+        "  version      print version and build identity\n"
+        "  probe        probe and report host capabilities\n"
+        "  info <elf>   describe a static or dynamic ELF64 executable\n"
+        "  run <file>   execute a raw x86-64 blob or Linux ELF64 executable\n"
+        "  help         show this message\n"
+        "\n"
+        "run options:\n"
+        "  --tier=0|1       0 = reference interpreter, 1 = AArch64+NEON JIT (default 1)\n"
+        "  --max-steps=N    guest instruction limit\n"
+        "  --sysroot=DIR    x86-64 rootfs prefix for PT_INTERP / shared libraries\n"
+        "  --quiet          suppress translator banner/summary (pure guest stdout + exit code)\n"
+        "  --dump           print final guest register state\n",
+        argv0);
 }
 
 int cmd_probe() {
@@ -73,7 +68,7 @@ bool read_file(const char* path, std::vector<std::uint8_t>& out) {
         std::fprintf(stderr, "hyperion: cannot open '%s'\n", path);
         return false;
     }
-    std::uint8_t buffer[4096];
+    std::uint8_t buffer[8192];
     std::size_t n = 0;
     while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) {
         out.insert(out.end(), buffer, buffer + n);
@@ -82,7 +77,6 @@ bool read_file(const char* path, std::vector<std::uint8_t>& out) {
     return true;
 }
 
-// Print a parsed ELF image. Read-only: nothing is mapped or executed.
 int cmd_info(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "hyperion: info needs a file argument\n");
@@ -118,8 +112,8 @@ int cmd_info(int argc, char** argv) {
     return 0;
 }
 
-// Execute a raw code blob: the original flat-memory path, unchanged.
-int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_steps, bool dump) {
+int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_steps, bool quiet,
+             bool dump) {
     if (code.size() > kMemSize) {
         std::fprintf(stderr, "hyperion: blob is larger than the %zu-byte load window\n", kMemSize);
         return 2;
@@ -142,13 +136,17 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
     } else {
         hyperion::TranslationCache cache;
         result = cache.run(memory, state, max_steps);
-        std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+        if (!quiet) {
+            std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+        }
     }
 
-    std::printf("status: %s\n", hyperion::to_string(result.status));
-    std::printf("steps:  %llu\n", static_cast<unsigned long long>(result.steps));
-    if (!result.message.empty()) {
-        std::printf("detail: %s\n", result.message.c_str());
+    if (!quiet) {
+        std::printf("status: %s\n", hyperion::to_string(result.status));
+        std::printf("steps:  %llu\n", static_cast<unsigned long long>(result.steps));
+        if (!result.message.empty()) {
+            std::printf("detail: %s\n", result.message.c_str());
+        }
     }
     if (dump) {
         std::printf("%s", hyperion::to_string(result.state).c_str());
@@ -156,21 +154,36 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
     return result.status == hyperion::RunStatus::kOk ? 0 : 1;
 }
 
-// Execute an ELF image: map its segments, build a startup stack, and run with
-// the guest syscall layer enabled.
-int run_elf(const std::vector<std::uint8_t>& file, int tier, std::uint64_t max_steps, bool dump) {
-    hyperion::GuestAddressSpace space;
+int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string>& guest_argv,
+            const std::string& sysroot, int tier, std::uint64_t max_steps, bool quiet, bool dump) {
+    // Disjoint 256 MiB heap at 0x20000000 and 1 GiB per-mapping ceiling at 0x7f0000000000.
+    hyperion::GuestAddressSpace space(0x7f0000000000ULL, 0x20000000ULL, 256ULL << 20);
     hyperion::GuestState state;
-    hyperion::ElfError err = hyperion::ElfError::kNone;
-    const std::vector<std::string> argv = {"hyperion-guest"};
-    auto image = hyperion::load_elf64(file, space, state, argv, err);
-    if (!image) {
-        std::fprintf(stderr, "hyperion: cannot load image: %s\n", hyperion::to_string(err));
+
+    std::vector<std::string> envp;
+    if (environ != nullptr) {
+        for (char** ep = environ; *ep != nullptr; ++ep) {
+            // Force C locale when running foreign arch binaries without matching locale-archive.
+            if (std::strncmp(*ep, "LC_", 3) == 0 || std::strncmp(*ep, "LANG=", 5) == 0) {
+                continue;
+            }
+            envp.emplace_back(*ep);
+        }
+    }
+    envp.emplace_back("LC_ALL=C");
+
+    const hyperion::LoadedElf loaded = hyperion::load_linux_elf_process(
+        file.data(), file.size(), space, state, guest_argv, envp, sysroot);
+    if (!loaded.ok()) {
+        std::fprintf(stderr, "hyperion: cannot load image: %s\n",
+                     hyperion::to_string(loaded.error));
         return 1;
     }
-    std::printf("loaded ELF at entry 0x%llx (rsp=0x%llx)\n",
-                static_cast<unsigned long long>(image->entry),
-                static_cast<unsigned long long>(state.reg(hyperion::Gpr::kRsp)));
+    if (!quiet) {
+        std::printf("loaded ELF at entry 0x%llx (rsp=0x%llx)\n",
+                    static_cast<unsigned long long>(loaded.entry),
+                    static_cast<unsigned long long>(state.reg(hyperion::Gpr::kRsp)));
+    }
 
     if (tier == 1 && !hyperion::ExecMem::executable_supported()) {
         std::fprintf(stderr, "hyperion: this host cannot execute generated AArch64 code; "
@@ -179,51 +192,87 @@ int run_elf(const std::vector<std::uint8_t>& file, int tier, std::uint64_t max_s
     }
 
     hyperion::MinimalSyscallHandler syscalls({}, &space);
+    syscalls.enable_linux_compat(sysroot);
+
     hyperion::RunResult result;
     if (tier == 0) {
         result = hyperion::run_program(space, state, max_steps, &syscalls);
     } else {
         hyperion::TranslationCache cache;
         result = cache.run(space, state, max_steps, &syscalls);
-        std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+        if (!quiet) {
+            std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+        }
     }
 
-    std::printf("status: %s\n", hyperion::to_string(result.status));
-    std::printf("steps:  %llu\n", static_cast<unsigned long long>(result.steps));
-    if (result.unimplemented_syscalls != 0) {
-        std::printf("unimplemented syscalls: %llu\n",
-                    static_cast<unsigned long long>(result.unimplemented_syscalls));
-    }
-    if (!result.message.empty()) {
-        std::printf("detail: %s\n", result.message.c_str());
+    if (!quiet) {
+        std::printf("status: %s\n", hyperion::to_string(result.status));
+        std::printf("steps:  %llu\n", static_cast<unsigned long long>(result.steps));
+        if (result.unimplemented_syscalls != 0) {
+            std::printf("unimplemented syscalls: %llu\n",
+                        static_cast<unsigned long long>(result.unimplemented_syscalls));
+        }
+        if (!result.message.empty()) {
+            std::printf("detail: %s\n", result.message.c_str());
+        }
     }
     if (dump) {
         std::printf("%s", hyperion::to_string(result.state).c_str());
     }
-    return result.status == hyperion::RunStatus::kOk ? 0 : 1;
+    if (result.status != hyperion::RunStatus::kOk) {
+        return 1;
+    }
+    if (quiet && result.exited_via_syscall) {
+        return static_cast<int>(result.exit_code & 0xFF);
+    }
+    return 0;
 }
 
 int cmd_run(int argc, char** argv) {
-    if (argc < 3) {
-        std::fprintf(stderr, "hyperion: run needs a file argument\n");
-        return 2;
-    }
-    const char* path = argv[2];
+    const char* path = nullptr;
     int tier = 1;
-    std::uint64_t max_steps = kDefaultMaxSteps;
+    bool explicit_steps = false;
+    std::uint64_t max_steps = kDefaultBlobMaxSteps;
+    bool quiet = false;
     bool dump = false;
-    for (int i = 3; i < argc; ++i) {
+    std::string sysroot;
+    if (const char* env_sr = std::getenv("HYPERION_SYSROOT"); env_sr != nullptr) {
+        sysroot = env_sr;
+    }
+    std::vector<std::string> guest_argv;
+
+    for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--") {
+            for (int j = i + 1; j < argc; ++j) {
+                guest_argv.emplace_back(argv[j]);
+            }
+            break;
+        }
         if (arg.rfind("--tier=", 0) == 0) {
             tier = std::atoi(arg.c_str() + 7);
         } else if (arg.rfind("--max-steps=", 0) == 0) {
             max_steps = std::strtoull(arg.c_str() + 12, nullptr, 10);
+            explicit_steps = true;
+        } else if (arg.rfind("--sysroot=", 0) == 0) {
+            sysroot = arg.substr(10);
+        } else if (arg == "--quiet" || arg == "-q") {
+            quiet = true;
         } else if (arg == "--dump") {
             dump = true;
-        } else {
+        } else if (arg.rfind('-', 0) == 0 && path == nullptr) {
             std::fprintf(stderr, "hyperion: unknown run option '%s'\n", arg.c_str());
             return 2;
+        } else if (path == nullptr) {
+            path = argv[i];
+        } else {
+            guest_argv.emplace_back(arg);
         }
+    }
+
+    if (path == nullptr) {
+        std::fprintf(stderr, "hyperion: run needs a file argument\n");
+        return 2;
     }
     if (tier != 0 && tier != 1) {
         std::fprintf(stderr, "hyperion: --tier must be 0 or 1\n");
@@ -237,9 +286,13 @@ int cmd_run(int argc, char** argv) {
     }
 
     if (hyperion::looks_like_elf(code.data(), code.size())) {
-        return run_elf(code, tier, max_steps, dump);
+        std::vector<std::string> full_argv;
+        full_argv.emplace_back(path);
+        full_argv.insert(full_argv.end(), guest_argv.begin(), guest_argv.end());
+        return run_elf(code, full_argv, sysroot, tier,
+                       explicit_steps ? max_steps : kDefaultElfMaxSteps, quiet, dump);
     }
-    return run_blob(code, tier, max_steps, dump);
+    return run_blob(code, tier, max_steps, quiet, dump);
 }
 
 } // namespace
