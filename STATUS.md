@@ -3,7 +3,8 @@
 **Last updated:** 2026-10-19
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
 Phase 6 (Linux ABI and syscall compatibility) — tenth slice implemented;
-Phase 3/4 code generator extended with MOV memory operands (soft MMU)
+Phase 3/4 code generator extended with MOV, ALU and INC/DEC memory operands
+(soft MMU)
 **Repository state:** buildable, tested, documented. **Two execution
 tiers exist: the reference interpreter (Tier 0) and a translation cache that runs
 whole programs through generated AArch64 code (Tier 1).** Phase 4's exit criteria
@@ -12,10 +13,11 @@ optimisation*: on AArch64 under `qemu-user`, Tier 1 is ~12.8× faster than Tier 
 on a fixed loop workload (BENCHMARKS.md §4.2), and **six optimizations are now
 accepted and measured** (parity fast path, dead-`rip` elimination, flag
 liveness, direct-mapped dispatch, ALU immediate folding, guest-register
-allocation — BENCHMARKS.md §4.2.1–4.2.6). **Tier 1 now translates MOV memory
-operands** (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) through a soft-MMU
-runtime helper, with a fault reported as `kMemoryFault`; ALU memory operands are
-still refused. Phase 6's syscall inventory is
+allocation — BENCHMARKS.md §4.2.1–4.2.6). **Tier 1 now translates memory
+operands for MOV (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) and for the
+ALU read-modify-write forms and INC/DEC (`add/sub/and/or/xor/cmp r,[mem]`,
+`… [mem],r`, `inc/dec [mem]`) through soft-MMU runtime helpers, with a fault
+reported as `kMemoryFault`.** Phase 6's syscall inventory is
 complete and validated
 (docs/syscalls/), and **ten syscall slices are implemented in both tiers**: the
 first (`write`/`exit`/`exit_group`), the second, which added the guest
@@ -403,11 +405,11 @@ required to agree. Whole-program differentials (a counted loop, taken and
 not-taken conditional branches, and a memory program) pass under `qemu-user`.
 There is still **no
 block chaining and no cache invalidation**; guest-register allocation exists
-**within a block** (Phase 5). **MOV memory operands are now translated** in
-Tier 1 through a soft-MMU runtime helper (`hyperion_load`/`hyperion_store`): a
-translated load/store resolves the guest address through the same `Memory`
-interface the interpreter uses and reports a fault as `kMemoryFault` rather than
-a wrong value. ALU memory operands and the guest stack are still refused
+**within a block** (Phase 5). **Memory operands are now translated** in Tier 1
+through soft-MMU runtime helpers (`hyperion_load`/`hyperion_store`): MOV, the ALU
+read-modify-write forms and INC/DEC all resolve the guest address through the
+same `Memory` interface the interpreter uses and report a fault as
+`kMemoryFault` rather than a wrong value. The guest stack is still refused
 explicitly rather than miscompiled, and the interpreter remains the only
 *complete* execution path.
 
@@ -465,13 +467,26 @@ removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native | `scripts/dev.sh test` | 10/10 ctest passed (195 unit cases, 0 failed, 15 skipped) |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (214 unit cases, 0 failed, 2 skipped) |
+| Native | `scripts/dev.sh test` | 10/10 ctest passed (195 unit cases, 0 failed, 17 skipped) |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (216 unit cases, 0 failed, 2 skipped) |
 | Clang | `scripts/dev.sh clang-build` | 10/10 passed |
 | ASan/UBSan | `scripts/dev.sh sanitize` | 10/10 passed |
 | Formatting | `scripts/dev.sh format` | clean (clang-format 19.1.7) |
 | Lint | `shellcheck scripts/*.sh tests/cli/*.sh` | clean |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
+
+Re-verified after the **ALU / INC/DEC memory-operand** increment: native
+**195/0**, 17 skipped (of 212); cross **216/0**, 2 skipped (of 218) under
+`qemu-user`; ASan/UBSan **10/10 ctest**; clang-build **10/10 ctest**; format
+clean; shellcheck clean. The generated AArch64 for the new forms was
+**executed**, not assumed: `translator.differential_alu_memory_operands`
+(read-modify-write chain plus `cmp` through memory, comparing registers, all six
+flags and the memory word against the interpreter) and
+`translator.differential_alu_memory_fault_is_reported` (an ALU store to an
+unmapped address reports `kMemoryFault` with rip on the faulting instruction)
+both run under `qemu-aarch64`. Acceptance for 15 encodings is pinned by
+`translator.translates_alu_memory_forms`, with the bytes checked against GNU
+`as`/`objdump`.
 
 Re-verified after the **MOV memory-operand** increment (soft MMU): native
 **195/0**, 15 skipped (of 210); cross **214/0**, 2 skipped (of 216) under
@@ -833,17 +848,19 @@ Then, independent and larger (Phase 5):
 
 Then, larger Phase 6/7 work (independent):
 
-- **ALU memory operands in the code generator.** MOV memory operands now work
-  (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) via the soft-MMU runtime
-  helper; every *other* memory operand is still refused by `validate_body`, so
-  Tier 1 stops honestly at the first one (see
-  `translator.refuses_alu_memory_operands`). The natural next increment is the
-  ALU read-modify-write form (`add/sub/and/or/xor/cmp r, [m]` and `… [m], r`),
-  reusing the same effective-address emission and the load/store helpers:
-  load, apply the register-or-immediate operation, store back, with the fault
-  path exiting the block as `kMemoryFault`. Require the whole differential suite
-  (including the new memory differentials) to pass before accepting, and add a
-  focused differential per form.
+- **Next code-generator increment (pick one).** ALU and INC/DEC memory operands
+  now work alongside MOV, all through the soft-MMU helper. The next natural
+  steps, in rough order of value:
+  - **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
+    rejects (`kUnsupportedOperand`). It is ubiquitous in real position-independent
+    code, so it is the biggest single blocker to running anything real, and it is
+    a small, self-contained decoder change plus an effective-address case.
+  - **The guest stack** (`push`/`pop`/`call`/`ret` with rsp), which is what turns
+    "blocks" into "programs"; it needs `rsp` modelled as an ordinary guest
+    register in the effective-address path.
+  - **Block chaining / cache invalidation**, the remaining Phase 4 gap.
+  Require the whole differential suite (including the memory differentials) to
+  pass before accepting, and add a focused differential per form.
 - **Extend coverage in U4 order** (`docs/syscalls/U4.md`) beyond the above:
   `getrandom`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl` (TLS setup is
   required for most dynamically linked programs).

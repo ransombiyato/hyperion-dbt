@@ -72,9 +72,10 @@ to `AT_FDCWD` and a bounded guest pathname, and it forwards to the host kernel �
 Hyperion is **not a sandbox** (SECURITY.md, DECISIONS.md D-025). The identity
 getters return the host process's ids (Hyperion runs the guest in-process);
 `gettid` assumes single-threaded execution. The guest
-stack (`push`/`pop`/`ret`) and ALU memory operands are still *refused explicitly*
-rather than miscompiled; **MOV memory operands now work** — `mov r64,[mem]`,
-`mov [mem],r64` and the 32-bit forms lower to a soft-MMU runtime helper
+stack (`push`/`pop`/`ret`) is still *refused explicitly* rather than miscompiled;
+**memory operands now work** — `mov r64,[mem]`, `mov [mem],r64`, the 32-bit
+forms, the ALU read-modify-write forms (`add/sub/and/or/xor/cmp r,[m]` and
+`... [m],r`) and `inc/dec [m]` lower to soft-MMU runtime helpers
 (`hyperion_load`/`hyperion_store`), and a faulting access exits the block as
 `kMemoryFault`. The interpreter remains the only *complete* execution
 path. Phase 5 continues with block chaining; `STATUS.md` §4 lists the steps.
@@ -192,10 +193,12 @@ the fourth (`openat`/`fstat`), the fifth (the process-identity getters plus
 `getcwd`/`getrandom`), the sixth (`newfstatat`, glibc's stat entry point), and
 the seventh (`access`/`readlink`), the eighth (`readlinkat`), the ninth
 (`getdents64`), and the tenth (`statx`).
-MOV memory operands are now translated in Tier 1 (soft-MMU helpers), so the next
-concrete code-generation step is the **ALU memory operand** (`add/sub/… r, [m]`
-and `… [m], r`); the next syscall step is the remaining U4/E1 syscalls a real
-program needs to start (`arch_prctl`, `set_tid_address`, `rseq`).** Guest state, the
+Memory operands are now translated in Tier 1 (MOV, ALU read-modify-write,
+INC/DEC, all via soft-MMU helpers), so the next concrete code-generation step is
+**RIP-relative addressing** (`[rip+disp]`), which the decoder still rejects and
+which real position-independent code uses constantly; the next syscall step is
+the remaining U4/E1 syscalls a real program needs to start (`arch_prctl`,
+`set_tid_address`, `rseq`).** Guest state, the
 decoder, the reference interpreter, the subset contract (`COMPATIBILITY.md` §2),
 the hardware differential, the AArch64 encoder, executable memory,
 single-instruction translation, whole-block translation, the translation-cache
@@ -313,15 +316,16 @@ and pass.
     number's `status` in `docs/syscalls/inventory.tsv` to `implemented`,
     regenerate (`python3 tools/gen_syscall_inventory.py`), add a focused test per
     call, and update STATUS.md §0e.
-17. ~~(Phase 6/7): memory operands in the code generator.~~ **MOV memory
-    operands are done** (soft-MMU helpers; `translator.differential_memory_operands`
-    runs under `qemu-user`). The next memory increment is the **ALU
-    read-modify-write** form (`add/sub/and/or/xor/cmp r, [m]` and `… [m], r`):
-    reuse the effective-address emission and the load/store helpers — load, apply
-    the register-or-immediate operation, store back — with the fault path exiting
-    the block as `kMemoryFault`. Every other memory operand is still refused by
-    `validate_body` (`translator.refuses_alu_memory_operands`), so Tier 1 stops
-    honestly at the first one rather than mistranslating.
+17. ~~(Phase 6/7): memory operands in the code generator.~~ **MOV, ALU
+    read-modify-write and INC/DEC memory operands are done** (soft-MMU helpers;
+    `translator.differential_memory_operands` and
+    `translator.differential_alu_memory_operands` run under `qemu-user`). The next
+    memory increment is **RIP-relative addressing** (`[rip+disp]`): the decoder
+    rejects it today (`kUnsupportedOperand`), and real position-independent code
+    uses it constantly, so it is the biggest single blocker to running anything
+    real. It is a small decoder change (ModRM `mod=00`, `rm=101`) plus an
+    effective-address case that adds the *next instruction's* address to the
+    displacement; require a focused differential.
 18. **Also open (Phase 5): block chaining.** Today every block exit returns to
     the dispatcher for a lookup. Link a block's exit directly to its successor's
     generated code so a hot loop stays in generated code, guarded by the same

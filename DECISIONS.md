@@ -848,9 +848,10 @@ values travel together rather than through an out-pointer.
 **Consequences.** MOV memory operands work in Tier 1 today; a faulting access
 exits the block with `BlockResult::kMemoryFault` and the dispatcher maps it to
 `RunStatus::kFault`, with `rip` on the faulting instruction — never a silent
-wrong value. Every other memory operand (an ALU read-modify-write) is still
-refused, so an unsupported form is refused, not mistranslated. The cost is a
-helper call per access (LIM-017); a fast path for identity-mapped regions or a
-host-page cache is Phase 5 optimization work, and it must preserve the
-single-definition property above. `push`/`pop`/`ret` remain interpreter-only
-until a guest stack is mapped.
+wrong value. The ALU read-modify-write forms and INC/DEC on memory reuse exactly
+this path (helper load, register operation, helper store), so they inherit the
+same fault contract rather than adding a second one. An unsupported memory form
+is still refused, not mistranslated. The cost is a helper call per access
+(LIM-017); a fast path for identity-mapped regions or a host-page cache is
+Phase 5 optimization work, and it must preserve the single-definition property
+above. `push`/`pop`/`ret` remain interpreter-only until a guest stack is mapped.

@@ -6,7 +6,7 @@ demonstrated by evidence**, not merely by the existence of code.
 Status legend: ✅ complete · 🟡 in progress · ⬜ not started
 
 **Overall: Phases 0–1 complete; Phases 2–6 in progress (Phase 6 has ten
-syscall slices landed, and Tier 1 now translates MOV memory operands).**
+syscall slices landed, and Tier 1 now translates MOV, ALU and INC/DEC memory operands).**
 
 | Phase | Title | Status |
 | --- | --- | --- |
@@ -183,10 +183,12 @@ stepping semantics already exist.
    immediate operands. All six x86 flags (CF/PF/AF/ZF/SF/OF) are *computed in
    generated code* from AArch64 NZCV plus two ALU identities, not delegated to
    the interpreter. Control flow (`jmp`/`jcc`/`ret`) and the stack
-   (`push`/`pop`) are refused explicitly (Phase 4). **MOV memory operands are
-   translated** (Phase 6 increment): `mov r64,[mem]` / `mov [mem],r64` and the
-   32-bit forms lower to the soft-MMU runtime helpers (`hyperion_load`/
-   `hyperion_store`); every other memory operand is still refused explicitly.
+   (`push`/`pop`) are refused explicitly (Phase 4). **Memory operands are
+   translated** (Phase 6 increment): `mov r64,[mem]` / `mov [mem],r64`, the
+   32-bit forms, the ALU read-modify-write forms (`add/sub/and/or/xor/cmp r,[m]`
+   and `... [m],r`) and `inc/dec [m]` all lower to the soft-MMU runtime helpers
+   (`hyperion_load`/`hyperion_store`); the guest stack is still refused
+   explicitly.
    A 847-case differential test
    executes the generated blocks under `qemu-user` and compares every register
    and all six flags against the interpreter.
@@ -379,9 +381,19 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   faulting instruction. Executed and compared against the interpreter under
   `qemu-user` (`translator.differential_memory_operands`, a store/load round trip
   with 32-bit forms, plus `syscall.mmap_end_to_end_under_generated_code`).
-- ⬜ ALU memory operands (`add/sub/... r, [m]` and `... [m], r`) -- **next**;
-  every other memory operand is still refused by `validate_body` rather than
-  mistranslated.
+- ✅ **ALU and INC/DEC memory operands in Tier 1 (soft MMU).** The
+  read-modify-write forms (`add/sub/and/or/xor r,[m]`, `... [m],r`,
+  `add/sub/and/or/xor [m],imm`) and `inc/dec [m]` load through
+  `hyperion_load`, apply the register operation, and store through
+  `hyperion_store`; `cmp [m],r` reads memory and writes only flags. Same fault
+  contract as MOV: a load or store fault exits the block with `kMemoryFault` and
+  `rip` on the faulting instruction. Executed and compared against the
+  interpreter under `qemu-user`
+  (`translator.differential_alu_memory_operands`, `..._fault_is_reported`).
+- ⬜ RIP-relative addressing (`[rip+disp]`) -- **next**; the decoder still
+  rejects it, and it is ubiquitous in real position-independent code.
+- ⬜ The guest stack (`push`/`pop`/`call`/`ret`) and block chaining /
+  cache invalidation (Phase 4).
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.

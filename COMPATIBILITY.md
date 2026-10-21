@@ -9,9 +9,9 @@ Tracks implemented versus missing instruction and ABI features.
 > `read`/`close`/`lseek` over a guest descriptor table; `openat`/`fstat`; the
 > process-identity getters plus `getcwd`/`getrandom`; `newfstatat`; `access`
 > and `readlink`; `readlinkat`; `getdents64`; `statx`) exist;
-> register allocation and MOV memory operands (via the soft-MMU runtime helpers)
-> are implemented in the code generator, while ALU memory operands and block
-> chaining do not (§5).
+> register allocation and memory operands (MOV, ALU read-modify-write and
+> INC/DEC, via the soft-MMU runtime helpers) are implemented in the code
+> generator, while block chaining does not (§5).
 
 Legend: ✅ implemented + tested · 🟡 implemented, untested · 🧪 prototype · ❌ unsupported (explicit) · ⬜ planned
 
@@ -139,14 +139,16 @@ decoder accepts but the translator does not is refused with an explicit
 | `jcc rel8` (`0x70..0x7F`) | ✅ | block exits with `kJcc`; writes target or fall-through `rip` |
 | `push`, `pop`, `ret` | ⬜ | needs a guest stack / address space (Phase 6) |
 | `syscall` (`0F 05`) | ✅ | block exits with `kSyscall`; the dispatcher runs the handler. `rip` is advanced past the instruction |
-| ALU memory operand (`add r, [m]`, `add [m], r`) | ⬜ | **Rejected by the code generator** (`translator.cpp validate_body`): a read-modify-write through memory is refused, so Tier 1 stops the block there rather than emitting wrong code. The interpreter executes it. Phase 6/7 |
+| ALU memory operand (`add r, [m]`, `add [m], r`, `inc/dec [m]`) | ✅ | **Lowered to the soft-MMU helpers**: load, apply the operation on registers, store back (or, for `cmp`, flags only). A load or store fault exits the block as `kMemoryFault` with `rip` on the faulting instruction, matching the interpreter. Verified by `translator.differential_alu_memory_operands` (registers, all six flags and the memory word) and `..._fault_is_reported`, both executed under `qemu-user` |
+| Two memory operands (e.g. `mov [m], [m]`) | ❌ | x86-64 has no such form; `validate_body` refuses it as `kUnsupportedOperand` rather than guessing |
 
 Verified by `tests/unit/test_translator.cpp`: scope tests on every host, a
 single-instruction differential against the interpreter under `qemu-user` on
 AArch64 (847 operand cases plus a fixed instruction set), **and whole-program
-differentials** — a counted loop, taken/not-taken branches, and a memory
-program (store/load round trip, 32-bit forms, and a fault case) — that compare
-the final `GuestState`, step count and memory effects against `run_program`. The
+differentials** — a counted loop, taken/not-taken branches, a memory program
+(store/load round trip, 32-bit forms, and a fault case), and the ALU
+read-modify-write chain with its fault case — that compare the final
+`GuestState`, step count and memory effects against `run_program`. The
 `hyperion run --tier=1` CLI runs a complete program through generated AArch64
 code and is required to agree with tier 0 (`tests/cli/cli_smoke.sh`).
 

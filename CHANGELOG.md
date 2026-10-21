@@ -5,6 +5,36 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — Phase 6/7: ALU and INC/DEC memory operands (soft MMU)
+
+### Added
+- **ALU read-modify-write and INC/DEC memory operands in Tier 1.**
+  `add/sub/and/or/xor/cmp r,[mem]`, `... [mem],r`, the immediate form
+  `add/sub/and/or/xor [mem],imm`, and `inc/dec [mem]` now lower to a
+  soft-MMU helper load, the register operation, and (except for `cmp`, which
+  writes only flags) a helper store. They reuse the MOV path and its fault
+  contract exactly (D-032): a load or store fault exits the block with
+  `BlockResult::kMemoryFault` and `rip` on the faulting instruction.
+- Tests: `translator.translates_alu_memory_forms` (15 encodings, bytes checked
+  against GNU `as`/`objdump`), and the AArch64 differentials
+  `translator.differential_alu_memory_operands` (a read-modify-write chain plus
+  `cmp` through memory, comparing registers, all six flags and the memory word
+  against the interpreter) and `translator.differential_alu_memory_fault_is_reported`.
+
+### Changed
+- `translator.cpp`: `emit_one`'s ALU case and INC/DEC case each gained a memory
+  path (dst or src memory). `validate_body` now accepts register, immediate and
+  memory operands for every body opcode, refusing only two memory operands and
+  non-body operand kinds. `regs_read_write` no longer attributes a memory
+  destination to a guest register, so the allocator stops counting and pinning a
+  register the instruction does not touch.
+
+### Known limitations
+- LIM-018: an ALU read-modify-write recomputes its effective address, because
+  the load helper call clobbers the scratch registers that held it.
+
+---
+
 ## [Unreleased] — Phase 6/7: MOV memory operands in the code generator (soft MMU)
 
 ### Added
@@ -26,17 +56,17 @@ Meaningful changes by milestone. Format loosely follows
   `RunStatus::kFault`. A fault is never a silent wrong value.
 - `a64::Encoder::cbnz` (compare-and-branch on non-zero), used to test a helper's
   fault flag in one instruction.
-- Tests: `translator.translates_mov_memory_forms`,
-  `translator.refuses_alu_memory_operands`, the AArch64 differentials
+- Tests: `translator.translates_mov_memory_forms`, the AArch64 differentials
   `translator.differential_memory_operands` (store/load round trip, 32-bit
   forms, SIB addressing) and `translator.differential_memory_fault_is_reported`,
   `syscall.mmap_end_to_end_under_generated_code` (a raw `mmap` + store runs end
   to end through generated code), and four `runtime_helpers` unit tests.
 
 ### Changed
-- `translator.cpp`: `validate_body` now accepts a MOV memory operand and refuses
-  every other memory operand (an ALU read-modify-write is a later increment), so
-  an unsupported memory form is still refused, not mistranslated.
+- `translator.cpp`: `validate_body` accepted a MOV memory operand and refused
+  every other memory operand at the time of this milestone (the ALU
+  read-modify-write forms landed in the following increment), so an unsupported
+  memory form was refused, not mistranslated.
   `regs_read_write` counts a memory operand's base/index registers as reads.
 - `TranslationCache::run` installs the run's `Memory` in the helper's thread-local
   for the duration of the run (RAII, restored on exit, so nested runs are safe).
