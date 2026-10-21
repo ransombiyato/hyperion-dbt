@@ -91,6 +91,14 @@ cache_toolchain() {
     for tool in /usr/bin/aarch64-linux-gnu-*; do
         [ -e "${tool}" ] && paths+=("${tool}")
     done
+    # The cross binutils binaries are dynamically linked against the target
+    # libopcodes/libbfd/libctf (named *-arm64.so) in the host libdir. Without
+    # them `as` fails with "cannot open shared object file", so the restored
+    # toolchain cannot assemble anything.
+    local lib
+    for lib in /usr/lib/x86_64-linux-gnu/lib*-arm64.so*; do
+        [ -e "${lib}" ] && paths+=("${lib}")
+    done
     [ ${#paths[@]} -gt 0 ] || die "no AArch64 cross toolchain found; run scripts/bootstrap.sh first"
 
     echo "  archiving ${#paths[@]} path(s) into ${tarball} ..."
@@ -153,12 +161,20 @@ install_host() {
         die "no .deb files in ${vendor_dir}"
     fi
     echo "==> installing ${#debs[@]} vendored host package(s) (needs root)"
-    # --no-download prefers the local files; apt fetches only unmet dependencies.
-    if ! ${SUDO} apt-get install -y --no-download "${debs[@]}"; then
-        echo "toolcache: offline install failed; retrying with the network for" >&2
-        echo "           any missing dependencies ..." >&2
-        ${SUDO} apt-get install -y "${debs[@]}" || true
-    fi
+    # Install each .deb on its own with dpkg. This matters: apt installs the
+    # whole list as one transaction, so a single unsatisfiable package (the
+    # vendored cmake depends on libarchive13t64, which some base images cannot
+    # satisfy) aborts the entire batch and leaves ninja/shellcheck uninstalled.
+    # dpkg -i takes each package independently; a failure is reported but does
+    # not block the others.
+    local deb
+    for deb in "${debs[@]}"; do
+        ${SUDO} dpkg -i "${deb}" >/dev/null 2>&1 || \
+            echo "toolcache: dpkg could not install $(basename "${deb}"); continuing" >&2
+    done
+    # Resolve any missing dependencies from the network when available.
+    ${SUDO} apt-get -f install -y >/dev/null 2>&1 || true
+
     # The vendored cmake .deb depends on libarchive13t64, which some base images
     # cannot satisfy, leaving a cmake that fails to load. Detect a non-working
     # cmake and fall back to the self-contained PyPI wheel (no system libs).
@@ -172,7 +188,18 @@ install_host() {
         ${SUDO} ln -sf "${wheel_bin}/ctest" /usr/bin/ctest 2>/dev/null || true
         ${SUDO} ln -sf "${wheel_bin}/cpack" /usr/bin/cpack 2>/dev/null || true
     fi
-    echo "==> done; verify with: cmake --version && ninja --version && shellcheck --version"
+
+    local missing=0 t
+    for t in cmake ninja shellcheck; do
+        if command -v "${t}" >/dev/null 2>&1; then
+            echo "  ok      ${t}  ($(${t} --version 2>&1 | head -1))"
+        else
+            echo "  MISSING ${t}" >&2
+            missing=$((missing + 1))
+        fi
+    done
+    [ "${missing}" -eq 0 ] || die "${missing} host tool(s) still missing; the build will not work"
+    echo "==> done; all host tools present"
 }
 
 status() {
