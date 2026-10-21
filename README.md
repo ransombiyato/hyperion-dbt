@@ -36,6 +36,30 @@ assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 
 ---
 
+## If you are a new agent: start here
+
+Everything needed to continue the project is **in this repository**. In order:
+
+1. Read [`STATUS.md`](STATUS.md) §4 — the single best next action — then
+   [`docs/agent-handoff.md`](docs/agent-handoff.md) (where we are, how to verify,
+   what to do next) and [`ROADMAP.md`](ROADMAP.md).
+2. Restore the toolchain and build. `cmake`/`ninja`/`shellcheck` come from
+   committed `.deb`s and the AArch64 cross toolchain comes from the committed
+   tarball, so this works from a **fresh clone with no package mirror**:
+
+   ```bash
+   scripts/toolcache.sh install-host   # cmake/ninja/shellcheck from committed debs
+   scripts/toolcache.sh restore        # AArch64 cross toolchain from the committed tarball
+   scripts/dev.sh build && scripts/dev.sh test    # expect: all tests passed
+   scripts/dev.sh cross-test           # AArch64 under qemu-user
+   ```
+
+3. Work in small, verified increments and commit each one. Correctness before
+   speed; never claim a test passed or a push succeeded unless it did. The rules
+   are in [`docs/agent-handoff.md`](docs/agent-handoff.md) §9.
+
+---
+
 ## What is actually implemented today
 
 | Capability | State |
@@ -190,7 +214,8 @@ under `qemu-user` and compares every register and flag against the interpreter.
 
 The development container does not persist `/usr` between sessions, but the
 repository does, so the emulator and cross toolchain are cached under
-`tools/cache/` (git-ignored). After a reset, restore them offline with:
+`tools/cache/`; the two restore artefacts (the cross toolchain tarball and the
+static `qemu-aarch64`) are **committed**, so a fresh clone restores offline with:
 
 ```bash
 scripts/toolcache.sh restore

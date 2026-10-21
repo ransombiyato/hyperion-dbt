@@ -780,6 +780,185 @@ HYPERION_TEST("translator", "cached_block_memory_stack_call_ret_and_sse2_match_i
     HYPERION_CHECK(got.state.xmm[1] == ref.state.xmm[1]);
 }
 
+HYPERION_TEST("translator", "differential_mov_imm32_operands") {
+    // The 0xC7 /0 form of MOV: `mov r/m64, imm32` (imm32 sign-extended) and
+    // `mov r/m32, imm32`. This is what glibc's `_start` uses to load `main`, so
+    // it must work in generated code as well as in the interpreter. Bytes
+    // verified with `as`/`objdump` (GNU binutils, Intel syntax):
+    //   mov rbx, 0x55667788      48 c7 c3 88 77 66 55
+    //   mov rcx, -1              48 c7 c1 ff ff ff ff
+    //   mov [rax], 42            48 c7 00 2a 00 00 00
+    //   mov [rax+8], -1          48 c7 40 08 ff ff ff ff
+    //   mov [rax+0x10], -8       48 c7 40 10 f8 ff ff ff
+    //   mov dword [rax+0x18], ... c7 40 18 78 56 34 12   (32-bit store)
+    //   hlt                      f4
+    const std::vector<std::uint8_t> program = {
+        0x48, 0xC7, 0xC3, 0x88, 0x77, 0x66, 0x55,       // mov rbx, 0x55667788
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,       // mov rcx, -1
+        0x48, 0xC7, 0x00, 0x2A, 0x00, 0x00, 0x00,       // mov qword [rax], 42
+        0x48, 0xC7, 0x40, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, // mov qword [rax+8], -1
+        0x48, 0xC7, 0x40, 0x10, 0xF8, 0xFF, 0xFF, 0xFF, // mov qword [rax+0x10], -8
+        0xC7, 0x40, 0x18, 0x78, 0x56, 0x34, 0x12,       // mov dword [rax+0x18], 0x12345678
+        0xF4,                                           // hlt
+    };
+    const std::uint64_t buffer = kBase + 0x100;
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRax) = buffer;
+
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial);
+
+    HYPERION_CHECK(actual.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(actual.steps, expected.steps);
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRbx), expected.state.reg(Gpr::kRbx));
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), expected.state.reg(Gpr::kRcx));
+    // The 64-bit immediate form must sign-extend: rbx keeps the positive imm32
+    // zero-extended, rcx becomes all ones.
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRbx), std::uint64_t{0x55667788});
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), std::uint64_t{0xFFFFFFFFFFFFFFFFULL});
+
+    std::uint64_t at_0 = 0;
+    std::uint64_t at_8 = 0;
+    std::uint64_t at_10 = 0;
+    std::uint32_t at_18 = 0;
+    HYPERION_CHECK(tier1_mem.read(buffer, reinterpret_cast<std::uint8_t*>(&at_0), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 8, reinterpret_cast<std::uint8_t*>(&at_8), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 0x10, reinterpret_cast<std::uint8_t*>(&at_10), 8));
+    HYPERION_CHECK(tier1_mem.read(buffer + 0x18, reinterpret_cast<std::uint8_t*>(&at_18), 4));
+    HYPERION_CHECK_EQ(at_0, std::uint64_t{42});
+    HYPERION_CHECK_EQ(at_8, std::uint64_t{0xFFFFFFFFFFFFFFFFULL});
+    HYPERION_CHECK_EQ(at_10, std::uint64_t{0xFFFFFFFFFFFFFFF8ULL});
+    HYPERION_CHECK_EQ(at_18, std::uint32_t{0x12345678});
+}
+
+HYPERION_TEST("translator", "differential_memory_fault_is_reported") {
+    // A translated load from an unmapped address must report a fault and stop
+    // with rip on the faulting instruction, matching the interpreter. If the
+    // helper's fault flag were ignored, the block would store a bogus value and
+    // run on.
+    //   mov r9, [rbx-8]   4c 8b 4b f8
+    //   hlt               f4
+    const std::vector<std::uint8_t> program = {0x4C, 0x8B, 0x4B, 0xF8, 0xF4};
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRbx) = 0xDEAD0000ULL; // far outside the flat region
+
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial);
+
+    HYPERION_CHECK(expected.status == hyperion::RunStatus::kFault);
+    HYPERION_CHECK(actual.status == hyperion::RunStatus::kFault);
+    HYPERION_CHECK_EQ(actual.state.rip, kBase);                      // the faulting instruction
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kR9), std::uint64_t{0}); // not written
+}
+
+HYPERION_TEST("translator", "differential_alu_memory_operands") {
+    // ALU read-modify-write through memory, executed through generated AArch64
+    // code and compared against the interpreter (the oracle). Encodings verified
+    // with `as`/`objdump` (GNU binutils, Intel syntax):
+    //   mov rbx, [rax]            48 8b 18
+    //   add rbx, 5                48 83 c3 05
+    //   add [rax], rbx            48 01 18
+    //   inc qword [rax]           48 ff 00
+    //   sub [rax], rbx            48 29 18
+    //   dec qword [rax]           48 ff 08
+    //   cmp [rax], rbx            48 39 18   (sets flags, writes no memory)
+    //   xor [rax], rbx            48 31 18
+    //   mov rcx, [rax]            48 8b 08
+    //   hlt                       f4
+    const std::vector<std::uint8_t> program = {
+        0x48, 0x8B, 0x18,       // mov rbx, [rax]
+        0x48, 0x83, 0xC3, 0x05, // add rbx, 5
+        0x48, 0x01, 0x18,       // add [rax], rbx
+        0x48, 0xFF, 0x00,       // inc qword [rax]
+        0x48, 0x29, 0x18,       // sub [rax], rbx
+        0x48, 0xFF, 0x08,       // dec qword [rax]
+        0x48, 0x39, 0x18,       // cmp [rax], rbx
+        0x48, 0x31, 0x18,       // xor [rax], rbx
+        0x48, 0x8B, 0x08,       // mov rcx, [rax]
+        0xF4,                   // hlt
+    };
+    const std::uint64_t buffer = kBase + 0x100;
+    const std::uint64_t seeded = 0x0000000000000040ULL;
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRax) = buffer;
+
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    interp_mem.write(buffer, reinterpret_cast<const std::uint8_t*>(&seeded), 8);
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    tier1_mem.write(buffer, reinterpret_cast<const std::uint8_t*>(&seeded), 8);
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial);
+
+    HYPERION_CHECK(actual.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(actual.steps, expected.steps);
+    // Registers must match the oracle exactly, including all six flags from the
+    // last flag-writing instruction (the `cmp`).
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRbx), expected.state.reg(Gpr::kRbx));
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), expected.state.reg(Gpr::kRcx));
+    HYPERION_CHECK(actual.state.flags == expected.state.flags);
+    // And the memory effect must match. Starting from the seed 0x40:
+    //   mov rbx,[rax] -> 0x40 ; add rbx,5 -> 0x45
+    //   add [rax],rbx -> 0x85 ; inc [rax] -> 0x86 ; sub [rax],rbx -> 0x41
+    //   dec [rax] -> 0x40 ; cmp [rax],rbx (flags only) ; xor [rax],rbx -> 0x05
+    //   mov rcx,[rax] -> 0x05
+    std::uint64_t final_word = 0;
+    HYPERION_CHECK(tier1_mem.read(buffer, reinterpret_cast<std::uint8_t*>(&final_word), 8));
+    std::uint64_t expected_word = 0;
+    HYPERION_CHECK(interp_mem.read(buffer, reinterpret_cast<std::uint8_t*>(&expected_word), 8));
+    HYPERION_CHECK_EQ(final_word, expected_word);
+    HYPERION_CHECK_EQ(final_word, std::uint64_t{0x05});
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRcx), std::uint64_t{0x05});
+}
+
+HYPERION_TEST("translator", "differential_alu_memory_fault_is_reported") {
+    // A translated ALU store to an unmapped address must report a fault and stop
+    // with rip on the faulting instruction, matching the interpreter, rather
+    // than silently continuing with the memory write lost.
+    //   add [rbx], rax   48 01 03
+    //   hlt              f4
+    const std::vector<std::uint8_t> program = {0x48, 0x01, 0x03, 0xF4};
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRbx) = 0xDEAD0000ULL; // far outside the flat region
+    initial.reg(Gpr::kRax) = 1;
+
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial);
+
+    HYPERION_CHECK(expected.status == hyperion::RunStatus::kFault);
+    HYPERION_CHECK(actual.status == hyperion::RunStatus::kFault);
+    HYPERION_CHECK_EQ(actual.state.rip, kBase); // the faulting instruction
+}
+
 #else
 
 HYPERION_TEST("translator", "differential_mov_and_alu") {

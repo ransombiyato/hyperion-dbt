@@ -53,6 +53,12 @@ die() {
 # shared libraries, which is exactly what makes it survive a container reset.
 cache_qemu() {
     mkdir -p "${bin_dir}"
+    # A cached copy is authoritative and survives a reset that wipes /usr; if it
+    # is already here there is nothing to re-cache.
+    if [ -x "${qemu_cached}" ]; then
+        echo "  qemu already cached at ${qemu_cached}; leaving it in place"
+        return 0
+    fi
     local src=""
     if command -v qemu-aarch64-static >/dev/null 2>&1; then
         src="$(command -v qemu-aarch64-static)"
@@ -73,27 +79,34 @@ cache_toolchain() {
     mkdir -p "${tc_dir}"
     local tarball="${tc_dir}/aarch64-toolchain.tar.gz"
     local paths=()
-    local p
     for p in /usr/aarch64-linux-gnu /usr/lib/gcc-cross/aarch64-linux-gnu \
-        /usr/bin/aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-g++ \
-        /usr/bin/aarch64-linux-gnu-ld /usr/bin/aarch64-linux-gnu-as \
-        /usr/bin/aarch64-linux-gnu-ar /usr/bin/aarch64-linux-gnu-objdump \
-        /usr/bin/aarch64-linux-gnu-nm /usr/bin/aarch64-linux-gnu-strip; do
+        /usr/libexec/gcc-cross/aarch64-linux-gnu \
+        /usr/bin/aarch64-linux-gnu-gcc-14 /usr/bin/aarch64-linux-gnu-g++-14; do
         [ -e "${p}" ] && paths+=("${p}")
     done
-    shopt -s nullglob
-    for p in /usr/lib/x86_64-linux-gnu/libopcodes*arm64* \
-        /usr/lib/x86_64-linux-gnu/libbfd*arm64* \
-        /usr/lib/x86_64-linux-gnu/libsframe* \
-        /usr/lib/x86_64-linux-gnu/libctf* \
-        /usr/lib/x86_64-linux-gnu/libzstd*; do
-        [ -e "${p}" ] && paths+=("${p}")
+    # Every cross binutil (the ld/ld.bfd symlink pair, as, ar, objdump, …) and
+    # the driver symlinks. A glob, because an explicit list silently misses a
+    # symlink target and then the restored toolchain cannot link.
+    local tool
+    for tool in /usr/bin/aarch64-linux-gnu-*; do
+        [ -e "${tool}" ] && paths+=("${tool}")
     done
-    shopt -u nullglob
     [ ${#paths[@]} -gt 0 ] || die "no AArch64 cross toolchain found; run scripts/bootstrap.sh first"
 
     echo "  archiving ${#paths[@]} path(s) into ${tarball} ..."
-    tar -czf "${tarball}.tmp" -C / "${paths[@]#/}"
+    # Exclude what a plain `-static` cross build never links, to keep the
+    # committed tarball under GitHub's 50 MB recommended per-file size:
+    #   * the LTO-only binaries (lto1, lto-dump, lto-wrapper) — the project does
+    #     not build with -flto;
+    #   * the sanitizer and OpenMP runtimes (libasan/tsan/lsan/ubsan/hwasan,
+    #     libgomp, libitm) and the stdc++ extras — cross sanitizer builds are not
+    #     part of the suite (ASan/UBSan runs natively), so `bootstrap.sh` is the
+    #     path for them.
+    tar --exclude='*lto1' --exclude='*lto-dump*' --exclude='*lto-wrapper' \
+        --exclude='*libasan*' --exclude='*libtsan*' --exclude='*liblsan*' \
+        --exclude='*libubsan*' --exclude='*libhwasan*' --exclude='*libgomp*' \
+        --exclude='*libitm*' --exclude='*libstdc++exp*' --exclude='*libstdc++fs*' \
+        -czf "${tarball}.tmp" -C / "${paths[@]#/}"
     mv -f "${tarball}.tmp" "${tarball}"
     echo "  cached ${tarball}  ($(du -h "${tarball}" | cut -f1))"
 }
@@ -121,7 +134,6 @@ restore() {
     fi
     echo "==> restoring AArch64 cross toolchain from ${tarball} (needs root)"
     ${SUDO} tar -xzf "${tarball}" -C /
-    ${SUDO} ldconfig
     echo "==> restored; verify with: aarch64-linux-gnu-g++ --version"
 }
 
@@ -143,10 +155,22 @@ install_host() {
     echo "==> installing ${#debs[@]} vendored host package(s) (needs root)"
     # --no-download prefers the local files; apt fetches only unmet dependencies.
     if ! ${SUDO} apt-get install -y --no-download "${debs[@]}"; then
-        echo "toolcache: offline install failed; refreshing package index and" >&2
-        echo "           retrying with the network for unmet dependencies ..." >&2
-        ${SUDO} apt-get update
-        ${SUDO} apt-get install -y "${debs[@]}"
+        echo "toolcache: offline install failed; retrying with the network for" >&2
+        echo "           any missing dependencies ..." >&2
+        ${SUDO} apt-get install -y "${debs[@]}" || true
+    fi
+    # The vendored cmake .deb depends on libarchive13t64, which some base images
+    # cannot satisfy, leaving a cmake that fails to load. Detect a non-working
+    # cmake and fall back to the self-contained PyPI wheel (no system libs).
+    if ! cmake --version >/dev/null 2>&1; then
+        echo "toolcache: vendored cmake unusable; falling back to 'pip install cmake'" >&2
+        ${SUDO} rm -f /usr/bin/cmake
+        python3 -m pip install --quiet cmake
+        local wheel_bin
+        wheel_bin="$(python3 -c 'import cmake,os;print(os.path.join(os.path.dirname(cmake.__file__),"data","bin"))')"
+        ${SUDO} ln -sf "${wheel_bin}/cmake" /usr/bin/cmake
+        ${SUDO} ln -sf "${wheel_bin}/ctest" /usr/bin/ctest 2>/dev/null || true
+        ${SUDO} ln -sf "${wheel_bin}/cpack" /usr/bin/cpack 2>/dev/null || true
     fi
     echo "==> done; verify with: cmake --version && ninja --version && shellcheck --version"
 }
