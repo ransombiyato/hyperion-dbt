@@ -254,23 +254,31 @@ void regs_read_write(const Instruction& insn, bool reads[kGprCount], bool writes
     case Opcode::kAnd:
     case Opcode::kOr:
     case Opcode::kXor:
-        reads[static_cast<unsigned>(insn.dst.reg)] = true;
+        // A memory destination is read and written in memory, not in a register;
+        // only a register destination names a guest register here.
+        if (insn.dst.kind == OperandKind::kRegister) {
+            reads[static_cast<unsigned>(insn.dst.reg)] = true;
+            writes[static_cast<unsigned>(insn.dst.reg)] = true;
+        }
         if (insn.has_src && insn.src.kind == OperandKind::kRegister) {
             reads[static_cast<unsigned>(insn.src.reg)] = true;
         }
-        writes[static_cast<unsigned>(insn.dst.reg)] = true;
         break;
     case Opcode::kCmp:
         // Reads both operands, writes no register (only flags).
-        reads[static_cast<unsigned>(insn.dst.reg)] = true;
+        if (insn.dst.kind == OperandKind::kRegister) {
+            reads[static_cast<unsigned>(insn.dst.reg)] = true;
+        }
         if (insn.has_src && insn.src.kind == OperandKind::kRegister) {
             reads[static_cast<unsigned>(insn.src.reg)] = true;
         }
         break;
     case Opcode::kInc:
     case Opcode::kDec:
-        reads[static_cast<unsigned>(insn.dst.reg)] = true;
-        writes[static_cast<unsigned>(insn.dst.reg)] = true;
+        if (insn.dst.kind == OperandKind::kRegister) {
+            reads[static_cast<unsigned>(insn.dst.reg)] = true;
+            writes[static_cast<unsigned>(insn.dst.reg)] = true;
+        }
         break;
     default:
         // Control flow, syscall, hlt, nop: no guest register operand.
@@ -704,6 +712,104 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
     case Opcode::kOr:
     case Opcode::kXor:
     case Opcode::kCmp: {
+        // A memory operand makes this a read-modify-write (or a compare against
+        // memory). The guest address space is host-backed regions at arbitrary
+        // guest addresses, so the access goes through the soft-MMU runtime
+        // helpers exactly as the MOV forms do (D-032): load the memory value,
+        // run the operation on registers, store the result back. A fault on
+        // either access exits the block as kMemoryFault rather than continuing.
+        const bool dst_mem = insn.dst.kind == OperandKind::kMemory;
+        const bool src_mem = insn.has_src && insn.src.kind == OperandKind::kMemory;
+        if (dst_mem || src_mem) {
+            const std::size_t bytes = static_cast<std::size_t>(bits) / 8;
+            const a64::Label fault = e.new_label();
+            const a64::Label done = e.new_label();
+            const MemoryOperand& mem = dst_mem ? insn.dst.mem : insn.src.mem;
+
+            // A holds the destination value, B the source value, matching the
+            // register path below. Whichever side is memory arrives via the
+            // helper; the other side is a register or an immediate.
+            emit_effective_address(e, mem, ra, 0);
+            e.mov_imm64(1, bytes);
+            e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_load));
+            emit_helper_call(e, 16, 1, fault); // value -> x0, fault -> x1
+            // A 32-bit load leaves the upper half of x0 zero, which is the
+            // zero-extension a 32-bit x86 operand needs.
+            e.mov_reg(a64::Width::k64, dst_mem ? kA : kB, 0);
+
+            if (dst_mem) {
+                if (insn.src.kind == OperandKind::kRegister) {
+                    load_gpr_rb(e, ra, insn.src.reg, kB);
+                } else {
+                    const std::uint64_t value =
+                        (bits == 32) ? (insn.src.imm & 0xFFFFFFFFULL) : insn.src.imm;
+                    e.mov_imm64(kB, value);
+                }
+            } else {
+                load_gpr_rb(e, ra, insn.dst.reg, kA);
+            }
+
+            const bool is_logical = insn.opcode == Opcode::kAnd || insn.opcode == Opcode::kOr ||
+                                    insn.opcode == Opcode::kXor;
+            const bool is_sub = insn.opcode == Opcode::kSub || insn.opcode == Opcode::kCmp;
+            const std::uint8_t mask =
+                static_cast<std::uint8_t>(flags_written(insn.opcode) & live_flags);
+
+            if (is_logical) {
+                switch (insn.opcode) {
+                case Opcode::kAnd:
+                    e.and_(w, kR, kA, kB);
+                    break;
+                case Opcode::kOr:
+                    e.orr(w, kR, kA, kB);
+                    break;
+                default:
+                    e.eor(w, kR, kA, kB);
+                    break;
+                }
+                if (mask != 0) {
+                    emit_flags_logical(e, w, mask, kR);
+                }
+            } else {
+                if (mask & kFbAf) {
+                    e.eor(a64::Width::k64, kT2, kA, kB);
+                }
+                if (is_sub) {
+                    e.subs(w, kR, kA, kB);
+                } else {
+                    e.adds(w, kR, kA, kB);
+                }
+                if (mask != 0) {
+                    if (mask & kFbAf) {
+                        e.eor(a64::Width::k64, kT2, kT2, kR);
+                    }
+                    emit_flags_from_nzcv(e, is_sub, mask, kT2, kR);
+                }
+            }
+
+            // CMP writes nothing back; every other op stores the result. The
+            // effective address is recomputed because the load helper call
+            // clobbered the scratch registers that held it.
+            if (insn.opcode != Opcode::kCmp) {
+                emit_effective_address(e, mem, ra, 0);
+                e.mov_reg(a64::Width::k64, 1, kR);
+                e.mov_imm64(2, bytes);
+                e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_store));
+                emit_helper_call(e, 16, 0, fault);
+            }
+
+            e.b(done);
+            e.bind(fault);
+            emit_set_rip(e, insn.address); // stop at the faulting instruction
+            emit_return(e, BlockResult::kMemoryFault, ra);
+            e.bind(done);
+
+            if (write_rip) {
+                emit_advance_rip(e, insn);
+            }
+            return TranslateError::kNone;
+        }
+
         // Operate directly on the allocated host registers when both operands
         // are allocated; kA/kB/kR are used only as fallbacks. This is what turns
         // `add rdx, rax` into one `adds x, x, x` instead of load/load/add/store.
@@ -807,6 +913,55 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
 
     case Opcode::kInc:
     case Opcode::kDec: {
+        // A memory operand makes INC/DEC a read-modify-write through the
+        // soft-MMU helper, exactly as the ALU memory forms above.
+        if (insn.dst.kind == OperandKind::kMemory) {
+            const std::size_t bytes = static_cast<std::size_t>(bits) / 8;
+            const a64::Label fault = e.new_label();
+            const a64::Label done = e.new_label();
+            const bool is_sub_mem = insn.opcode == Opcode::kDec;
+            const std::uint8_t mask_mem =
+                static_cast<std::uint8_t>(flags_written(insn.opcode) & live_flags);
+
+            emit_effective_address(e, insn.dst.mem, ra, 0);
+            e.mov_imm64(1, bytes);
+            e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_load));
+            emit_helper_call(e, 16, 1, fault); // value -> x0, fault -> x1
+            e.mov_reg(a64::Width::k64, kA, 0);
+            e.movz(a64::Width::k32, kB, 1);
+            if (mask_mem & kFbAf) {
+                e.eor(a64::Width::k64, kT2, kA, kB);
+            }
+            if (is_sub_mem) {
+                e.subs(w, kR, kA, kB);
+            } else {
+                e.adds(w, kR, kA, kB);
+            }
+            if (mask_mem != 0) {
+                if (mask_mem & kFbAf) {
+                    e.eor(a64::Width::k64, kT2, kT2, kR);
+                }
+                emit_flags_from_nzcv(e, is_sub_mem, mask_mem, kT2, kR);
+            }
+
+            emit_effective_address(e, insn.dst.mem, ra, 0);
+            e.mov_reg(a64::Width::k64, 1, kR);
+            e.mov_imm64(2, bytes);
+            e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_store));
+            emit_helper_call(e, 16, 0, fault);
+
+            e.b(done);
+            e.bind(fault);
+            emit_set_rip(e, insn.address); // stop at the faulting instruction
+            emit_return(e, BlockResult::kMemoryFault, ra);
+            e.bind(done);
+
+            if (write_rip) {
+                emit_advance_rip(e, insn);
+            }
+            return TranslateError::kNone;
+        }
+
         // INC/DEC are ADD/SUB of 1, except that CF is preserved. flags_written()
         // excludes CF for these, so CF is never stored and its old value stands;
         // no explicit save/restore is needed. As with the ALU ops, operate
@@ -884,17 +1039,19 @@ TranslateError validate_body(const Instruction& insn) {
     if (insn.dst.kind != OperandKind::kRegister && insn.dst.kind != OperandKind::kMemory) {
         return TranslateError::kInternal;
     }
-    // Memory operands are supported only for MOV in this increment. An ALU
-    // read-modify-write through memory (add [rbx], rax / add rax, [rbx]) is a
-    // later increment; refusing it keeps it from being silently mistranslated
-    // as if the memory operand were a register.
-    if (insn.opcode != Opcode::kMov) {
-        if (insn.dst.kind == OperandKind::kMemory) {
-            return TranslateError::kUnsupportedOperand;
-        }
-        if (insn.has_src && insn.src.kind == OperandKind::kMemory) {
-            return TranslateError::kUnsupportedOperand;
-        }
+    // A memory operand is accepted for every body opcode: MOV already lowered to
+    // the soft-MMU helpers, and the ALU read-modify-write and INC/DEC forms now
+    // do too (load, operate, store back; D-032). The decoder never produces a
+    // form with two memory operands, and the emit paths above handle each shape
+    // that reaches them; anything else is still refused rather than
+    // mistranslated as if the memory operand were a register.
+    if (insn.has_src && insn.src.kind != OperandKind::kRegister &&
+        insn.src.kind != OperandKind::kImmediate && insn.src.kind != OperandKind::kMemory) {
+        return TranslateError::kInternal;
+    }
+    if (insn.dst.kind == OperandKind::kMemory && insn.has_src &&
+        insn.src.kind == OperandKind::kMemory) {
+        return TranslateError::kUnsupportedOperand; // two memory operands
     }
     return TranslateError::kNone;
 }
