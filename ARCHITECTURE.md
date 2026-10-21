@@ -258,14 +258,15 @@ vendored until that analysis is committed.
 
 | Directory | Component | Phase introduced |
 | --- | --- | --- |
-| `src/core/` | all core code today: version, host probe, guest state, decoder, interpreter, AArch64 encoder, executable memory, translator, translation cache, address space, syscall layer | 0–6 |
+| `src/core/` | all core code today: version, host probe, guest state, decoder, interpreter, AArch64 encoder, executable memory, translator, translation cache, address space, runtime helpers (soft MMU), syscall layer | 0–6 |
 | `src/cli/` | user interface | 0 |
 | `tests/`, `benchmarks/` | verification | 0 |
 
 **Reality note.** The component table in §2 names the logical components; the
 tree currently keeps all of them in `src/core/` (`decoder.cpp`,
 `interpreter.cpp`, `aarch64_encoder.cpp`, `exec_mem.cpp`, `translator.cpp`,
-`translation_cache.cpp`, `address_space.cpp`, `syscall.cpp`). Splitting into
+`translation_cache.cpp`, `runtime_helpers.cpp`, `address_space.cpp`,
+`syscall.cpp`). Splitting into
 `src/decoder/`, `src/codegen/` etc. was the original plan but was
 not done, and the project does not pretend otherwise. The split is deferred
 until the translator grows beyond single instructions and the boundaries are

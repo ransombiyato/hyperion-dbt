@@ -814,3 +814,43 @@ and anything else (`AT_EMPTY_PATH`, …) is reported unimplemented rather than
 silently dropped. The rule this establishes: rebuild a structure field by field
 only when the host and guest layouts *differ*; when the UAPI fixes the width,
 forward the bytes and let the kernel supply the semantics.
+
+---
+
+## D-032 — Memory operands are lowered to soft-MMU runtime helpers
+
+**Context.** The AArch64 code generator was register-only: `validate_body`
+rejected every instruction with a memory operand, so Tier 1 stopped at the first
+load or store. Every real program loads and stores, which made this the largest
+gap between the tiers. The obstacle is that the guest address space is a set of
+host-backed regions at *arbitrary guest addresses* (`address_space.hpp`): guest
+address `A` is not host address `A`, so generated code cannot dereference a guest
+address directly.
+
+**Decision.** A memory operand is lowered to a call into a runtime helper
+(`hyperion_load`/`hyperion_store`, `runtime_helpers.hpp`), which resolves the
+address through the same `Memory` interface the interpreter uses and copies the
+bytes. The generated code computes the effective address
+(`base + index*scale + disp`, mod 2^64) and calls the helper with it; the
+helper's result is the value (load) or a fault flag (both). The current `Memory`
+is held in a thread-local, installed by `TranslationCache::run` around the run
+and restored on exit (RAII), so a block invoked with no dispatcher faults rather
+than dereferencing a stale pointer, and nested runs do not clobber each other.
+
+This is the standard **soft MMU** approach and it was chosen over a shadow page
+table or a host-identity mapping because it keeps **one** definition of "valid
+access" shared with the interpreter: the differential tests compare the two
+tiers through the same interface, and there is no second address-translation
+mechanism to keep correct. The helper ABI is the C ABI (`extern "C"`); a load
+returns `LoadResult{value, fault}` in x0/x1 under AAPCS64, which is why the two
+values travel together rather than through an out-pointer.
+
+**Consequences.** MOV memory operands work in Tier 1 today; a faulting access
+exits the block with `BlockResult::kMemoryFault` and the dispatcher maps it to
+`RunStatus::kFault`, with `rip` on the faulting instruction — never a silent
+wrong value. Every other memory operand (an ALU read-modify-write) is still
+refused, so an unsupported form is refused, not mistranslated. The cost is a
+helper call per access (LIM-017); a fast path for identity-mapped regions or a
+host-page cache is Phase 5 optimization work, and it must preserve the
+single-definition property above. `push`/`pop`/`ret` remain interpreter-only
+until a guest stack is mapped.

@@ -9,8 +9,9 @@ Tracks implemented versus missing instruction and ABI features.
 > `read`/`close`/`lseek` over a guest descriptor table; `openat`/`fstat`; the
 > process-identity getters plus `getcwd`/`getrandom`; `newfstatat`; `access`
 > and `readlink`; `readlinkat`; `getdents64`; `statx`) exist;
-> register allocation is implemented, while memory operands in the code
-> generator and block chaining do not (§5).
+> register allocation and MOV memory operands (via the soft-MMU runtime helpers)
+> are implemented in the code generator, while ALU memory operands and block
+> chaining do not (§5).
 
 Legend: ✅ implemented + tested · 🟡 implemented, untested · 🧪 prototype · ❌ unsupported (explicit) · ⬜ planned
 
@@ -126,7 +127,7 @@ decoder accepts but the translator does not is refused with an explicit
 
 | Instruction | Translated? | Notes |
 | --- | --- | --- |
-| `mov` | ✅ | register and immediate, 32/64-bit; 32-bit zero-extends |
+| `mov` | ✅ | register and immediate, 32/64-bit; 32-bit zero-extends. **Memory forms** (`mov r64, [mem]` / `mov [mem], r64` / the 32-bit forms) lower to a runtime-helper call (soft MMU); a fault exits the block with `kMemoryFault` |
 | `add`, `sub` | ✅ | register and immediate, 32/64-bit; full flag set |
 | `and`, `or`, `xor` | ✅ | register and immediate; CF/OF/AF cleared |
 | `cmp` | ✅ | flags only, no writeback |
@@ -138,13 +139,14 @@ decoder accepts but the translator does not is refused with an explicit
 | `jcc rel8` (`0x70..0x7F`) | ✅ | block exits with `kJcc`; writes target or fall-through `rip` |
 | `push`, `pop`, `ret` | ⬜ | needs a guest stack / address space (Phase 6) |
 | `syscall` (`0F 05`) | ✅ | block exits with `kSyscall`; the dispatcher runs the handler. `rip` is advanced past the instruction |
-| memory operands | ⬜ | **Rejected by the code generator** (`translator.cpp validate_body`): Tier 1 stops the block at the first one rather than emitting wrong code. The interpreter executes them. Phase 6/7 |
+| ALU memory operand (`add r, [m]`, `add [m], r`) | ⬜ | **Rejected by the code generator** (`translator.cpp validate_body`): a read-modify-write through memory is refused, so Tier 1 stops the block there rather than emitting wrong code. The interpreter executes it. Phase 6/7 |
 
 Verified by `tests/unit/test_translator.cpp`: scope tests on every host, a
 single-instruction differential against the interpreter under `qemu-user` on
 AArch64 (847 operand cases plus a fixed instruction set), **and whole-program
-differentials** — a counted loop and taken/not-taken branches — that compare the
-final `GuestState` and step count against `run_program`. The
+differentials** — a counted loop, taken/not-taken branches, and a memory
+program (store/load round trip, 32-bit forms, and a fault case) — that compare
+the final `GuestState`, step count and memory effects against `run_program`. The
 `hyperion run --tier=1` CLI runs a complete program through generated AArch64
 code and is required to agree with tier 0 (`tests/cli/cli_smoke.sh`).
 

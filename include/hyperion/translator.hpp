@@ -56,10 +56,14 @@ struct Translation {
 
 // Value returned in x0 by a translated block.
 enum class BlockResult : std::uint64_t {
-    kOk = 0,      // block completed; guest state (including rip) is updated
-    kHalted = 1,  // HLT/RET: the program has stopped
-    kSyscall = 2, // a `syscall` instruction was reached; the dispatcher must
-                  // handle it. rip already points past the instruction.
+    kOk = 0,          // block completed; guest state (including rip) is updated
+    kHalted = 1,      // HLT/RET: the program has stopped
+    kSyscall = 2,     // a `syscall` instruction was reached; the dispatcher must
+                      // handle it. rip already points past the instruction.
+    kMemoryFault = 3, // a guest load/store faulted (unmapped or no Memory
+                      // installed). The block stopped at the faulting
+                      // instruction; rip points at it, not past it, so the
+                      // dispatcher can report the exact address.
 };
 
 // How a translated block left. Purely informational for callers: the

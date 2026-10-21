@@ -99,6 +99,32 @@ void Encoder::sub(Width w, Reg rd, Reg rn, Reg rm) {
     emit(sf_of(w) | kAddSubRegBase | (1u << 30) | (rm << 16) | (rn << 5) | rd);
 }
 
+void Encoder::add_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount) {
+    validate_reg(rd);
+    validate_reg(rn);
+    validate_reg(rm);
+    // Add/subtract (shifted register): bits 23-22 select the shift type and
+    // bits 15-10 hold the amount (5 bits for 32-bit, 6 for 64-bit operands).
+    const unsigned max_amount = (w == Width::k64) ? 63u : 31u;
+    if (amount > max_amount) {
+        throw std::invalid_argument("a64::Encoder: shift amount out of range");
+    }
+    emit(sf_of(w) | kAddSubRegBase | (static_cast<std::uint32_t>(shift) << 22) |
+         (static_cast<std::uint32_t>(rm) << 16) | (amount << 10) | (rn << 5) | rd);
+}
+
+void Encoder::sub_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount) {
+    validate_reg(rd);
+    validate_reg(rn);
+    validate_reg(rm);
+    const unsigned max_amount = (w == Width::k64) ? 63u : 31u;
+    if (amount > max_amount) {
+        throw std::invalid_argument("a64::Encoder: shift amount out of range");
+    }
+    emit(sf_of(w) | kAddSubRegBase | (1u << 30) | (static_cast<std::uint32_t>(shift) << 22) |
+         (static_cast<std::uint32_t>(rm) << 16) | (amount << 10) | (rn << 5) | rd);
+}
+
 void Encoder::and_(Width w, Reg rd, Reg rn, Reg rm) {
     validate_reg(rd);
     validate_reg(rn);
@@ -391,6 +417,19 @@ void Encoder::b_cond(Cond c, Label target) {
     check_label(target);
     const std::size_t at = code_.size();
     emit(0x54000000u | static_cast<std::uint32_t>(c)); // B.cond, imm19 placeholder
+    if (label_pos_[target] != kUnbound) {
+        resolve_patch(at, label_pos_[target], true);
+    } else {
+        fixups_.push_back({at, target, true});
+    }
+}
+
+void Encoder::cbnz(Reg rt, Label target) {
+    validate_reg(rt);
+    check_label(target);
+    const std::size_t at = code_.size();
+    // Compare-and-branch (64-bit): sf=1, op=1, base 0xB5000000, imm19 placeholder.
+    emit(0xB5000000u | rt);
     if (label_pos_[target] != kUnbound) {
         resolve_patch(at, label_pos_[target], true);
     } else {

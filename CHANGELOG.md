@@ -5,6 +5,51 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — Phase 6/7: MOV memory operands in the code generator (soft MMU)
+
+### Added
+- **MOV memory operands in Tier 1.** `mov r64, [mem]`, `mov [mem], r64` and
+  their 32-bit forms now lower to a call into a runtime load/store helper
+  instead of being refused. The effective address (`base + index*scale + disp`,
+  all mod 2^64) is computed in the generated code and the access is resolved
+  through the same `Memory` interface the interpreter uses, so guest address `A`
+  is never treated as host address `A`. This removes the single biggest gap
+  between the tiers and lets a translated program read and write memory.
+- `include/hyperion/runtime_helpers.hpp`, `src/core/runtime_helpers.cpp`:
+  `hyperion_load`/`hyperion_store` (C ABI, called from generated code) plus a
+  thread-local `Memory*` (`current_memory`/`set_current_memory`). A load returns
+  `LoadResult{value, fault}` in x0/x1 (AAPCS64); a store returns the fault flag
+  in x0. No `Memory` installed, or an unmapped address, sets the fault flag —
+  the helper never dereferences a stale pointer.
+- `BlockResult::kMemoryFault`: a translated load/store that faults exits its
+  block with `rip` on the faulting instruction; the dispatcher maps it to
+  `RunStatus::kFault`. A fault is never a silent wrong value.
+- `a64::Encoder::cbnz` (compare-and-branch on non-zero), used to test a helper's
+  fault flag in one instruction.
+- Tests: `translator.translates_mov_memory_forms`,
+  `translator.refuses_alu_memory_operands`, the AArch64 differentials
+  `translator.differential_memory_operands` (store/load round trip, 32-bit
+  forms, SIB addressing) and `translator.differential_memory_fault_is_reported`,
+  `syscall.mmap_end_to_end_under_generated_code` (a raw `mmap` + store runs end
+  to end through generated code), and four `runtime_helpers` unit tests.
+
+### Changed
+- `translator.cpp`: `validate_body` now accepts a MOV memory operand and refuses
+  every other memory operand (an ALU read-modify-write is a later increment), so
+  an unsupported memory form is still refused, not mistranslated.
+  `regs_read_write` counts a memory operand's base/index registers as reads.
+- `TranslationCache::run` installs the run's `Memory` in the helper's thread-local
+  for the duration of the run (RAII, restored on exit, so nested runs are safe).
+- `runtime_helpers.hpp`: `LoadResult` and the two helpers are declared at global
+  scope with the C ABI they are called through; the clang
+  `-Wreturn-type-c-linkage` warning on the struct return is suppressed locally
+  with a comment (the two-register layout is the contract, not an accident).
+- `syscall.mmap_end_to_end_under_generated_code_stops_at_memory_operand` is
+  replaced by `syscall.mmap_end_to_end_under_generated_code`, which now asserts
+  the store succeeds under generated code (the boundary it pinned has moved).
+
+---
+
 ## [Unreleased] — Phase 6, tenth syscall slice: `statx`(332)
 
 ### Added

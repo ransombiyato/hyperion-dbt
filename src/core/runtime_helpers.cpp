@@ -26,27 +26,29 @@ Memory* set_current_memory(Memory* memory) {
     return previous;
 }
 
-extern "C" std::uint64_t hyperion_load(std::uint64_t address, std::uint64_t* value,
-                                       std::uint64_t count) {
-    Memory* memory = tls_memory;
+} // namespace hyperion
+
+extern "C" LoadResult hyperion_load(std::uint64_t address, std::uint64_t count) {
+    LoadResult result;
+    hyperion::Memory* memory = hyperion::tls_memory;
     if (memory == nullptr) {
-        return 1;
+        result.fault = 1;
+        return result;
     }
     std::uint8_t buffer[8] = {};
     if (!memory->read(address, buffer, static_cast<std::size_t>(count))) {
-        return 1;
+        result.fault = 1;
+        return result;
     }
-    std::uint64_t assembled = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        assembled |= static_cast<std::uint64_t>(buffer[i]) << (8 * i);
+        result.value |= static_cast<std::uint64_t>(buffer[i]) << (8 * i);
     }
-    *value = assembled;
-    return 0;
+    return result;
 }
 
 extern "C" std::uint64_t hyperion_store(std::uint64_t address, std::uint64_t value,
                                         std::uint64_t count) {
-    Memory* memory = tls_memory;
+    hyperion::Memory* memory = hyperion::tls_memory;
     if (memory == nullptr) {
         return 1;
     }
@@ -56,5 +58,3 @@ extern "C" std::uint64_t hyperion_store(std::uint64_t address, std::uint64_t val
     }
     return memory->write(address, buffer, static_cast<std::size_t>(count)) ? 0 : 1;
 }
-
-} // namespace hyperion

@@ -1488,25 +1488,24 @@ HYPERION_TEST("syscall", "mmap_end_to_end_under_the_interpreter") {
 }
 
 #if defined(__aarch64__)
-// The AArch64 code generator is register-only today: it rejects any instruction
-// with a memory operand (translator.cpp validate_body) and stops the block
-// there rather than emitting wrong code. This program stores through the mmap
-// pointer with a memory operand, so under generated code it must stop with
-// kUnsupported *after* the mmap syscall has run. This test pins that boundary:
-// it is what "unsupported instructions are handled explicitly" means in
-// practice, and it will start asserting the successful store once the generator
-// learns memory operands.
-HYPERION_TEST("syscall", "mmap_end_to_end_under_generated_code_stops_at_memory_operand") {
+// The generator now lowers MOV through memory to a runtime helper (soft MMU),
+// so this program -- a raw mmap(2) syscall followed by a store through the
+// returned pointer -- runs end to end under generated code and must produce the
+// same result as the interpreter: the store lands in the mapping and the program
+// halts. The 32-bit store zero-extends into [rbx]'s 8 bytes, so only the low
+// byte is 0xAB; the helper assembles exactly `bytes` from the register, so the
+// following 7 bytes stay zero.
+HYPERION_TEST("syscall", "mmap_end_to_end_under_generated_code") {
     GuestAddressSpace as;
     Captured cap;
     const hyperion::RunResult r = run_mmap_program(as, cap, /*use_cache=*/true);
 
-    HYPERION_CHECK(r.status == RunStatus::kUnsupported);
+    HYPERION_CHECK(r.status == RunStatus::kOk); // the hlt after the store was reached
     HYPERION_CHECK_EQ(r.unimplemented_syscalls, std::uint64_t{0});        // mmap itself was handled
     HYPERION_CHECK_EQ(r.state.reg(Gpr::kRbx), std::uint64_t{0x50000000}); // mapping returned
     std::uint8_t stored = 0;
     HYPERION_CHECK(as.read(0x50000000, &stored, 1));
-    HYPERION_CHECK(stored == 0x00); // the store was never executed
+    HYPERION_CHECK(stored == 0xAB); // the store executed under generated code
 }
 #endif // __aarch64__
 

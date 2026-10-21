@@ -24,6 +24,8 @@
 
 #include "hyperion/translator.hpp"
 
+#include "hyperion/runtime_helpers.hpp"
+
 namespace hyperion {
 
 namespace {
@@ -223,12 +225,29 @@ std::uint8_t condition_flags(Condition c) {
 // names every register the instruction could read or write, so the allocation is
 // a pure fast path that never changes which registers exist.
 void regs_read_write(const Instruction& insn, bool reads[kGprCount], bool writes[kGprCount]) {
+    // A memory operand reads its base and index registers (the effective
+    // address), whatever the instruction does with the value. Doing this first
+    // keeps the address registers live for allocation.
+    const Operand* mem_ops[2] = {&insn.dst, insn.has_src ? &insn.src : nullptr};
+    for (const Operand* op : mem_ops) {
+        if (op != nullptr && op->kind == OperandKind::kMemory) {
+            if (op->mem.has_base) {
+                reads[static_cast<unsigned>(op->mem.base)] = true;
+            }
+            if (op->mem.has_index) {
+                reads[static_cast<unsigned>(op->mem.index)] = true;
+            }
+        }
+    }
     switch (insn.opcode) {
     case Opcode::kMov:
         if (insn.has_src && insn.src.kind == OperandKind::kRegister) {
             reads[static_cast<unsigned>(insn.src.reg)] = true;
         }
-        writes[static_cast<unsigned>(insn.dst.reg)] = true;
+        // A memory destination writes memory, not a register.
+        if (insn.dst.kind == OperandKind::kRegister) {
+            writes[static_cast<unsigned>(insn.dst.reg)] = true;
+        }
         break;
     case Opcode::kAdd:
     case Opcode::kSub:
@@ -375,6 +394,71 @@ TranslateError load_source(a64::Encoder& e, const Operand& src, a64::Reg dst, in
         return TranslateError::kUnsupportedOperand;
     }
     return TranslateError::kInternal;
+}
+
+// Compute an x86 effective address (base + index*scale + disp, all mod 2^64)
+// into `dst`, reading guest registers through the allocator fast path. Uses
+// kT0/kT1 as scratch, which must not alias `dst` or each other's live values.
+void emit_effective_address(a64::Encoder& e, const MemoryOperand& mem, const RegAlloc* ra,
+                            a64::Reg dst) {
+    if (mem.has_base) {
+        load_gpr_rb(e, ra, mem.base, dst);
+    } else {
+        e.movz(a64::Width::k64, dst, 0);
+    }
+    if (mem.has_index) {
+        load_gpr_rb(e, ra, mem.index, kT0);
+        unsigned shift = 0;
+        switch (mem.scale) {
+        case 2:
+            shift = 1;
+            break;
+        case 4:
+            shift = 2;
+            break;
+        case 8:
+            shift = 3;
+            break;
+        default:
+            shift = 0;
+            break;
+        }
+        if (shift == 0) {
+            e.add(a64::Width::k64, dst, dst, kT0);
+        } else {
+            e.add_shifted(a64::Width::k64, dst, dst, kT0, a64::Shift::kLsl, shift);
+        }
+    }
+    if (mem.disp != 0) {
+        const std::uint64_t magnitude = (mem.disp < 0)
+                                            ? (0ULL - static_cast<std::uint64_t>(mem.disp))
+                                            : static_cast<std::uint64_t>(mem.disp);
+        std::uint32_t imm12 = 0;
+        bool shift12 = false;
+        if (encode_imm12(magnitude, imm12, shift12)) {
+            if (mem.disp < 0) {
+                e.sub_imm(a64::Width::k64, dst, dst, imm12, shift12);
+            } else {
+                e.add_imm(a64::Width::k64, dst, dst, imm12, shift12);
+            }
+        } else {
+            e.mov_imm64(kT1, static_cast<std::uint64_t>(mem.disp));
+            e.add(a64::Width::k64, dst, dst, kT1);
+        }
+    }
+}
+
+// Call a runtime helper whose address has been materialised into `target`. The
+// helper is an ordinary C function, so it clobbers every caller-saved register,
+// including x8 (GuestState*) and x30 (this block's return address); both are
+// saved to the stack and restored. `fault_reg` holds the helper's fault flag
+// (x1 for the load's struct return, x0 for the store's scalar return) and a
+// non-zero value branches to `fault`.
+void emit_helper_call(a64::Encoder& e, a64::Reg target, a64::Reg fault_reg, a64::Label fault) {
+    e.stp_pre(kState, 30, 31, -16); // save GuestState* and LR
+    e.blr(target);
+    e.ldp_post(kState, 30, 31, 16); // restore them
+    e.cbnz(fault_reg, fault);
 }
 
 void emit_return(a64::Encoder& e, BlockResult result, const RegAlloc* ra = nullptr) {
@@ -550,6 +634,45 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
         return TranslateError::kNone;
 
     case Opcode::kMov: {
+        // Memory forms: `mov r64, [mem]` (0x8B) and `mov [mem], r64` (0x89).
+        // The guest address space is host-backed regions at arbitrary guest
+        // addresses, so the access goes through a runtime helper (soft MMU).
+        const bool dst_mem = insn.dst.kind == OperandKind::kMemory;
+        const bool src_mem = insn.has_src && insn.src.kind == OperandKind::kMemory;
+        if (dst_mem || src_mem) {
+            // 32- and 64-bit forms both reach here (0x89/0x8B with and without
+            // REX.W); the access width follows the operand size, and a 32-bit
+            // load zero-extends because the helper assembles only `bytes`.
+            const std::size_t bytes = static_cast<std::size_t>(bits) / 8;
+            const a64::Label fault = e.new_label();
+            const a64::Label done = e.new_label();
+
+            if (src_mem) {                                      // load: mov r64, [mem]
+                emit_effective_address(e, insn.src.mem, ra, 0); // x0 = address
+                e.mov_imm64(1, bytes);                          // x1 = count
+                e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_load));
+                emit_helper_call(e, 16, 1, fault); // value -> x0, fault -> x1
+                store_gpr_rb(e, ra, 0, insn.dst.reg);
+            } else {                                            // store: mov [mem], r64
+                emit_effective_address(e, insn.dst.mem, ra, 0); // x0 = address
+                load_gpr_rb(e, ra, insn.src.reg, 1);            // x1 = value
+                e.mov_imm64(2, bytes);                          // x2 = count
+                e.mov_imm64(16, reinterpret_cast<std::uint64_t>(&hyperion_store));
+                emit_helper_call(e, 16, 0, fault); // return -> x0 (fault flag)
+            }
+
+            e.b(done);
+            e.bind(fault);
+            emit_set_rip(e, insn.address); // stop at the faulting instruction
+            emit_return(e, BlockResult::kMemoryFault, ra);
+            e.bind(done);
+
+            if (write_rip) {
+                emit_advance_rip(e, insn);
+            }
+            return TranslateError::kNone;
+        }
+
         // If both operands are allocated, the move is a single host-register
         // move (the 32-bit form zero-extends, matching x86-64). If the source is
         // an immediate and the destination is allocated, materialise straight
@@ -758,14 +881,20 @@ TranslateError validate_body(const Instruction& insn) {
     if (insn.dst.size != OperandSize::k32 && insn.dst.size != OperandSize::k64) {
         return TranslateError::kUnsupportedSize;
     }
-    if (insn.dst.kind == OperandKind::kMemory) {
-        return TranslateError::kUnsupportedOperand;
-    }
-    if (insn.dst.kind != OperandKind::kRegister) {
+    if (insn.dst.kind != OperandKind::kRegister && insn.dst.kind != OperandKind::kMemory) {
         return TranslateError::kInternal;
     }
-    if (insn.has_src && insn.src.kind == OperandKind::kMemory) {
-        return TranslateError::kUnsupportedOperand;
+    // Memory operands are supported only for MOV in this increment. An ALU
+    // read-modify-write through memory (add [rbx], rax / add rax, [rbx]) is a
+    // later increment; refusing it keeps it from being silently mistranslated
+    // as if the memory operand were a register.
+    if (insn.opcode != Opcode::kMov) {
+        if (insn.dst.kind == OperandKind::kMemory) {
+            return TranslateError::kUnsupportedOperand;
+        }
+        if (insn.has_src && insn.src.kind == OperandKind::kMemory) {
+            return TranslateError::kUnsupportedOperand;
+        }
     }
     return TranslateError::kNone;
 }

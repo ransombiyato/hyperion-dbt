@@ -5,8 +5,8 @@ demonstrated by evidence**, not merely by the existence of code.
 
 Status legend: ✅ complete · 🟡 in progress · ⬜ not started
 
-**Overall: Phases 0–1 complete; Phases 2–6 in progress (Phase 6 has seven
-syscall slices landed).**
+**Overall: Phases 0–1 complete; Phases 2–6 in progress (Phase 6 has ten
+syscall slices landed, and Tier 1 now translates MOV memory operands).**
 
 | Phase | Title | Status |
 | --- | --- | --- |
@@ -183,8 +183,11 @@ stepping semantics already exist.
    immediate operands. All six x86 flags (CF/PF/AF/ZF/SF/OF) are *computed in
    generated code* from AArch64 NZCV plus two ALU identities, not delegated to
    the interpreter. Control flow (`jmp`/`jcc`/`ret`) and the stack
-   (`push`/`pop`) are refused explicitly (Phase 4); memory operands are refused
-   explicitly (need an address space, Phase 6). A 847-case differential test
+   (`push`/`pop`) are refused explicitly (Phase 4). **MOV memory operands are
+   translated** (Phase 6 increment): `mov r64,[mem]` / `mov [mem],r64` and the
+   32-bit forms lower to the soft-MMU runtime helpers (`hyperion_load`/
+   `hyperion_store`); every other memory operand is still refused explicitly.
+   A 847-case differential test
    executes the generated blocks under `qemu-user` and compares every register
    and all six flags against the interpreter.
 
@@ -220,9 +223,12 @@ block exits, cache invalidation, explicit handling of unsupported instructions.
 
 **Exit criteria.** A repeatable suite of small guest programs runs correctly.
 
-**Evidence.** `translator.differential_program_loops` (counted loop) and
-`translator.differential_branch_directions` (taken/not-taken) compare the final
-`GuestState` and step count against `run_program` and pass under `qemu-user`;
+**Evidence.** `translator.differential_program_loops` (counted loop),
+`translator.differential_branch_directions` (taken/not-taken) and
+`translator.differential_memory_operands` (store/load round trip, 32-bit forms,
+SIB addressing) compare the final
+`GuestState`, step count and memory effects against `run_program` and pass under
+`qemu-user`;
 `translator.dispatcher_*` prove unsupported instructions stop the run and an
 infinite loop is reported as a step limit rather than hanging. The
 `hyperion run --tier=1` CLI executes a whole program through generated AArch64
@@ -316,8 +322,8 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   implemented over it and marked `implemented` in the inventory. A file-backed
   `mmap` returns `-ENOSYS` and is counted as unimplemented rather than mapped
   wrongly. Tested end-to-end: a guest program mmaps a page, stores through the
-  returned pointer and the value is readable (Tier 0), and under Tier 1 the
-  syscall is handled and the block stops honestly at the memory-operand store.
+  returned pointer and the value is readable, **in both tiers** —Tier 1 now
+  translates the memory-operand store (see the next item).
 - ✅ **Guest descriptor table + `read`/`close`/`lseek`.** `MinimalSyscallHandler`
   owns a guest descriptor table (guest fd → host stream); `read`(0), `close`(3)
   and `lseek`(8) operate on it and are marked `implemented` in the inventory. A
@@ -362,6 +368,20 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
 - ⬜ The remaining U4 syscalls a program needs to start (`arch_prctl`,
   `set_tid_address`, `set_robust_list`, …) — **next**.
 - ⬜ Signals, threads, futexes.
+
+**Related code-generation work (Phase 3/4 surface, driven by Phase 6 needs).**
+
+- ✅ **MOV memory operands in Tier 1 (soft MMU).** `mov r64,[mem]`,
+  `mov [mem],r64` and the 32-bit forms lower to the runtime helpers
+  `hyperion_load`/`hyperion_store`, which resolve the guest address through the
+  same `Memory` interface the interpreter uses (D-032); a fault exits the block
+  with `kMemoryFault` and is reported as `RunStatus::kFault` with `rip` on the
+  faulting instruction. Executed and compared against the interpreter under
+  `qemu-user` (`translator.differential_memory_operands`, a store/load round trip
+  with 32-bit forms, plus `syscall.mmap_end_to_end_under_generated_code`).
+- ⬜ ALU memory operands (`add/sub/... r, [m]` and `... [m], r`) -- **next**;
+  every other memory operand is still refused by `validate_body` rather than
+  mistranslated.
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.

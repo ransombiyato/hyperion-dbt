@@ -1,9 +1,10 @@
 # STATUS
 
-**Last updated:** 2026-10-21
+**Last updated:** 2026-10-19
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
-Phase 6 (Linux ABI and syscall compatibility) — tenth slice implemented
-**Repository state:** buildable, tested, documented, CI green. **Two execution
+Phase 6 (Linux ABI and syscall compatibility) — tenth slice implemented;
+Phase 3/4 code generator extended with MOV memory operands (soft MMU)
+**Repository state:** buildable, tested, documented. **Two execution
 tiers exist: the reference interpreter (Tier 0) and a translation cache that runs
 whole programs through generated AArch64 code (Tier 1).** Phase 4's exit criteria
 are met and recorded. Phase 5 has begun with a *measured baseline before any
@@ -11,7 +12,10 @@ optimisation*: on AArch64 under `qemu-user`, Tier 1 is ~12.8× faster than Tier 
 on a fixed loop workload (BENCHMARKS.md §4.2), and **six optimizations are now
 accepted and measured** (parity fast path, dead-`rip` elimination, flag
 liveness, direct-mapped dispatch, ALU immediate folding, guest-register
-allocation — BENCHMARKS.md §4.2.1–4.2.6). Phase 6's syscall inventory is
+allocation — BENCHMARKS.md §4.2.1–4.2.6). **Tier 1 now translates MOV memory
+operands** (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) through a soft-MMU
+runtime helper, with a fault reported as `kMemoryFault`; ALU memory operands are
+still refused. Phase 6's syscall inventory is
 complete and validated
 (docs/syscalls/), and **ten syscall slices are implemented in both tiers**: the
 first (`write`/`exit`/`exit_group`), the second, which added the guest
@@ -396,9 +400,14 @@ authoritative next `rip`), and a **translation cache / dispatcher** runs complet
 guest programs block by block, keyed by guest PC. The `hyperion run --tier=0|1`
 command runs a raw x86-64 blob through either tier, and the two tiers are
 required to agree. Whole-program differentials (a counted loop, taken and
-not-taken conditional branches) pass under `qemu-user`. There is still **no
+not-taken conditional branches, and a memory program) pass under `qemu-user`.
+There is still **no
 block chaining and no cache invalidation**; guest-register allocation exists
-**within a block** (Phase 5). The guest stack and memory operands are refused
+**within a block** (Phase 5). **MOV memory operands are now translated** in
+Tier 1 through a soft-MMU runtime helper (`hyperion_load`/`hyperion_store`): a
+translated load/store resolves the guest address through the same `Memory`
+interface the interpreter uses and reports a fault as `kMemoryFault` rather than
+a wrong value. ALU memory operands and the guest stack are still refused
 explicitly rather than miscompiled, and the interpreter remains the only
 *complete* execution path.
 
@@ -456,13 +465,26 @@ removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native | `scripts/dev.sh test` | 10/10 ctest passed (187 unit cases, 0 failed, 13 skipped) |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (198 unit cases, 0 failed, 2 skipped) |
-| Clang | `scripts/dev.sh clang-build` | 10/10 passed (181 unit cases, 0 failed) |
-| ASan/UBSan | `scripts/dev.sh sanitize` | 10/10 passed (181 unit cases, 0 failed) |
+| Native | `scripts/dev.sh test` | 10/10 ctest passed (195 unit cases, 0 failed, 15 skipped) |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (214 unit cases, 0 failed, 2 skipped) |
+| Clang | `scripts/dev.sh clang-build` | 10/10 passed |
+| ASan/UBSan | `scripts/dev.sh sanitize` | 10/10 passed |
 | Formatting | `scripts/dev.sh format` | clean (clang-format 19.1.7) |
 | Lint | `shellcheck scripts/*.sh tests/cli/*.sh` | clean |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
+
+Re-verified after the **MOV memory-operand** increment (soft MMU): native
+**195/0**, 15 skipped (of 210); cross **214/0**, 2 skipped (of 216) under
+`qemu-user`; ASan/UBSan **10/10 ctest**; clang-build **10/10 ctest**; format
+clean. The generated AArch64 code that calls `hyperion_load`/`hyperion_store`
+was **executed**, not assumed: `translator.differential_memory_operands` (store /
+load round trip, 32-bit forms, fault case) and
+`syscall.mmap_end_to_end_under_generated_code` run under `qemu-aarch64` and
+agree with the interpreter. Two failures found during this work were real and
+were fixed before the commit: a stale `mmap`-under-generated-code test that
+still expected `kUnsupported` (the boundary it pinned has moved), and a clang
+`-Wreturn-type-c-linkage` error on the helper struct return (the clang build
+uses `-Werror`, so CI would have failed).
 
 Re-verified after the Phase 6 tenth slice (`statx`): native **187/0**, 13
 skipped (of 200); cross **204/0**, 2 skipped (of 206) under `qemu-user`;
@@ -733,13 +755,17 @@ stable-vs-noisy discrimination case).
   rather than as a separate guest kernel. For a single-process guest this is
   indistinguishable from the truth; `gettid` in particular assumes single-threaded
   execution and must be revisited when `clone` lands.
-- **Known limitation of Tier 1 (the code generator):** it is **register-only**.
-  Any instruction with a memory operand is rejected (`translator.cpp
-  validate_body`) and the block stops with `kUnsupported` rather than emitting
-  wrong code. So Tier 1 cannot yet execute a program that loads or stores, even
-  though Tier 0 (the interpreter) can and the syscall layer now supports
-  `mmap`/`brk`. This is the single biggest gap between the tiers and the gating
-  item for real programs; it is the "next" item in §4.
+- **Known limitation of Tier 1 (the code generator):** it is **register-only
+  for ALU operations**. MOV through memory now works — `mov r64, [mem]`,
+  `mov [mem], r64` and the 32-bit forms lower to a soft-MMU runtime helper
+  (`hyperion_load`/`hyperion_store`), so a translated program can read and write
+  memory, and a faulting access exits the block with `kMemoryFault` rather than
+  returning a wrong value. Every *other* memory operand (an ALU read-modify-write
+  such as `add r, [m]`) is still rejected (`translator.cpp validate_body`) and
+  the block stops with `kUnsupported` rather than emitting wrong code; that is
+  the next memory increment. Each translated memory access costs a helper call
+  (guest address `A` is not host address `A`), which is a Phase 5 optimization
+  target (LIM-017).
 - **Open questions:**
   - The AArch64 UML port has **not** been built or run. Its build is blocked by
     a host toolchain problem that also blocks stock x86-64 UML. Not measured on
@@ -798,13 +824,17 @@ Then, independent and larger (Phase 5):
 
 Then, larger Phase 6/7 work (independent):
 
-- **Memory operands in the code generator.** The AArch64 generator is
-  register-only: it rejects any instruction with a memory operand
-  (`translator.cpp validate_body`). Every real program loads and stores, so this
-  is the gating item for running anything nontrivial in Tier 1. It is the
-  natural pairing with `read`/`openat`, because a syscall result buffer is
-  written to guest memory. Until it lands, Tier 1 stops honestly at the first
-  memory operand (see the `mmap_end_to_end_..._stops_at_memory_operand` test).
+- **ALU memory operands in the code generator.** MOV memory operands now work
+  (`mov r64,[mem]` / `mov [mem],r64` / 32-bit forms) via the soft-MMU runtime
+  helper; every *other* memory operand is still refused by `validate_body`, so
+  Tier 1 stops honestly at the first one (see
+  `translator.refuses_alu_memory_operands`). The natural next increment is the
+  ALU read-modify-write form (`add/sub/and/or/xor/cmp r, [m]` and `… [m], r`),
+  reusing the same effective-address emission and the load/store helpers:
+  load, apply the register-or-immediate operation, store back, with the fault
+  path exiting the block as `kMemoryFault`. Require the whole differential suite
+  (including the new memory differentials) to pass before accepting, and add a
+  focused differential per form.
 - **Extend coverage in U4 order** (`docs/syscalls/U4.md`) beyond the above:
   `getrandom`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl` (TLS setup is
   required for most dynamically linked programs).

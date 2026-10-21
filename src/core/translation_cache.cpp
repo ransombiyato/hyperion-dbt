@@ -7,6 +7,8 @@
 
 #include <string>
 
+#include "hyperion/runtime_helpers.hpp"
+
 namespace hyperion {
 
 namespace {
@@ -112,6 +114,15 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
         return out;
     }
 
+    // Generated code reaches guest memory through the runtime helpers, which
+    // resolve against the current thread's Memory. Install it for the duration
+    // of the run and restore whatever was there before, so a nested run (a test
+    // driving the cache from inside another run) cannot clobber it.
+    struct MemoryScope {
+        Memory* previous;
+        ~MemoryScope() { set_current_memory(previous); }
+    } memory_scope{set_current_memory(&memory)};
+
     std::uint64_t steps = 0;
     while (true) {
         const std::uint64_t pc = out.state.rip;
@@ -141,6 +152,15 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
 
         if (result == BlockResult::kHalted) {
             out.status = RunStatus::kOk;
+            out.steps = steps;
+            return out;
+        }
+        if (result == BlockResult::kMemoryFault) {
+            // A translated load/store faulted. rip points at the faulting
+            // instruction (the block did not advance it), so the report names
+            // the exact address rather than a resume point.
+            out.status = RunStatus::kFault;
+            out.message = "guest memory fault at pc=0x" + std::to_string(out.state.rip);
             out.steps = steps;
             return out;
         }

@@ -12,13 +12,20 @@
 // "valid access" for both tiers.
 //
 // The current Memory* is held in a thread-local so the helper signature stays
-// small (address in x0, value in x1). The dispatcher installs it around a run
-// and restores the previous value, so nested runs (e.g. a differential test
-// that drives a cache from inside a test) do not clobber each other.
+// small. The dispatcher installs it around a run and restores the previous
+// value, so nested runs (e.g. a differential test that drives a cache from
+// inside a test) do not clobber each other.
+//
+// ABI: these are called from generated code, so the C ABI is part of the
+// contract. Under AAPCS64 a two-`uint64_t` struct is returned in x0 (first
+// member) and x1 (second), which is why `LoadResult` returns the loaded value
+// and the fault flag together rather than through an out-pointer. `count` is
+// 1, 2, 4 or 8; both helpers use the interpreter's little-endian,
+// value-in-low-bits convention (interpreter.cpp read_operand/write_operand), so
+// a translated access matches the oracle bit-for-bit.
 #ifndef HYPERION_RUNTIME_HELPERS_HPP
 #define HYPERION_RUNTIME_HELPERS_HPP
 
-#include <cstddef>
 #include <cstdint>
 
 namespace hyperion {
@@ -26,21 +33,41 @@ namespace hyperion {
 class Memory;
 
 // The Memory the helpers resolve against for the current thread. A null value
-// makes every helper fail (returns 1), so a block that is invoked without a
-// dispatcher faults rather than dereferencing a stale pointer.
+// makes every helper fault (fault = 1), so a block invoked without a dispatcher
+// faults rather than dereferencing a stale pointer.
 Memory* current_memory();
 Memory* set_current_memory(Memory* memory); // returns the previous value
 
-// Copy `count` bytes between the guest address `address` and the buffer at
-// `value`. Return 0 on success, 1 on a fault (unmapped address or no Memory).
-// `count` is 1, 2, 4 or 8; the helpers use the same little-endian,
-// value-in-low-bits convention the interpreter uses (interpreter.cpp
-// read_operand/write_operand), so a load/store matches it bit-for-bit.
-extern "C" std::uint64_t hyperion_load(std::uint64_t address, std::uint64_t* value,
-                                       std::uint64_t count);
+} // namespace hyperion
+
+// A load returns both the value and a fault flag. `value` is the little-endian
+// assembly of `count` bytes at `address` (0 on fault); `fault` is 0 on success
+// and 1 on an unmapped address or a missing Memory.
+//
+// LoadResult is declared at global scope, and the helpers below as plain
+// `extern "C"`, because generated code calls them through the C ABI. The type
+// is a C-compatible aggregate: two `uint64_t` members in order, which AAPCS64
+// returns in x0 and x1. Clang warns that returning a user-defined type from an
+// `extern "C"` function is "incompatible with C"; the layout is exactly the two
+// registers generated code reads, so the warning is suppressed here rather than
+// working around it with an out-pointer (which would add a store on every
+// translated load).
+struct LoadResult {
+    std::uint64_t value = 0;
+    std::uint64_t fault = 0;
+};
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+#endif
+extern "C" LoadResult hyperion_load(std::uint64_t address, std::uint64_t count);
+// Stores the low `count` bytes of `value` at `address`. Returns 0 on success,
+// 1 on a fault.
 extern "C" std::uint64_t hyperion_store(std::uint64_t address, std::uint64_t value,
                                         std::uint64_t count);
-
-} // namespace hyperion
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #endif // HYPERION_RUNTIME_HELPERS_HPP

@@ -32,6 +32,7 @@
 
 using hyperion::a64::Cond;
 using hyperion::a64::Encoder;
+using hyperion::a64::Label;
 using hyperion::a64::Shift;
 using hyperion::a64::Width;
 
@@ -129,6 +130,36 @@ HYPERION_TEST("aarch64_encoder", "br_and_blr_register_indirect") {
     HYPERION_CHECK_EQ(e.code()[0], 0xD61F0120u); // br x9
     HYPERION_CHECK_EQ(e.code()[1], 0xD63F0140u); // blr x10
     HYPERION_CHECK_EQ(e.code()[2], 0xD63F0100u); // blr x8
+}
+
+HYPERION_TEST("aarch64_encoder", "add_sub_shifted_register") {
+    // Encodings verified against aarch64-linux-gnu-as: add x0,x1,x2,lsl #3 =
+    // 0x8b020c20, sub x3,x4,x5,lsl #2 = 0xcb050883. Used to form a memory
+    // effective address (index*scale) in one instruction.
+    Encoder e;
+    e.add_shifted(Width::k64, 0, 1, 2, Shift::kLsl, 3);
+    e.sub_shifted(Width::k64, 3, 4, 5, Shift::kLsl, 2);
+    HYPERION_CHECK_EQ(e.code()[0], 0x8B020C20u);
+    HYPERION_CHECK_EQ(e.code()[1], 0xCB050883u);
+}
+
+HYPERION_TEST("aarch64_encoder", "cbnz_forward_and_backward") {
+    // cbnz x1, <8> ; nop ; <8>: cbnz x0, <10> ; nop ; <10>:
+    // Verified against aarch64-linux-gnu-as: 0xb5000041, 0xd503201f,
+    // 0xb5000040, 0xd503201f. Used to test a helper's fault flag.
+    Encoder e;
+    const Label skip = e.new_label();
+    e.cbnz(1, skip);
+    e.nop();
+    e.bind(skip);
+    const Label done = e.new_label();
+    e.cbnz(0, done);
+    e.nop();
+    e.bind(done);
+    HYPERION_CHECK_EQ(e.code()[0], 0xB5000041u);
+    HYPERION_CHECK_EQ(e.code()[1], 0xD503201Fu);
+    HYPERION_CHECK_EQ(e.code()[2], 0xB5000040u);
+    HYPERION_CHECK_EQ(e.code()[3], 0xD503201Fu);
 }
 
 HYPERION_TEST("aarch64_encoder", "forward_branch_patch") {

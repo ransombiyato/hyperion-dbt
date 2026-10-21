@@ -68,6 +68,11 @@ public:
     // --- data processing (register) -------------------------------------
     void add(Width w, Reg rd, Reg rn, Reg rm);
     void sub(Width w, Reg rd, Reg rn, Reg rm);
+    // ADD/SUB with a shifted register: Rd = Rn +/- (Rm shifted by `amount`).
+    // Used to form a memory effective address (index*scale) without a separate
+    // shift instruction.
+    void add_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount);
+    void sub_shifted(Width w, Reg rd, Reg rn, Reg rm, Shift shift, unsigned amount);
     void and_(Width w, Reg rd, Reg rn, Reg rm);
     void orr(Width w, Reg rd, Reg rn, Reg rm);
     void eor(Width w, Reg rd, Reg rn, Reg rm);
@@ -140,6 +145,9 @@ public:
     // Unconditional B and conditional B.cond to a label.
     void b(Label target);
     void b_cond(Cond c, Label target);
+    // Compare-and-branch on a register being non-zero (CBNZ), used to test a
+    // runtime helper's fault flag without a separate CMP.
+    void cbnz(Reg rt, Label target);
     // Branch to the address in `rn`. `blr` additionally writes the return
     // address into X30 (LR), so generated code can call a runtime helper.
     void br(Reg rn);
