@@ -35,7 +35,7 @@ fi
 if grep -qiE '^[[:space:]]*- x86-64 instruction decoding$' <<<"$status"; then
     fail "'status' still lists instruction decoding as NOT IMPLEMENTED"
 fi
-if ! grep -q 'run <exe>' <<<"$(bash "${WRAPPER}" help)"; then
+if ! grep -q 'run <file>' <<<"$(bash "${WRAPPER}" help)"; then
     fail "'help' does not advertise the run command"
 fi
 
@@ -44,6 +44,18 @@ fi
 if ! grep -q '^  package ' <<<"$(bash "${WRAPPER}" help)"; then
     fail "'help' does not advertise the package command"
 fi
+
+# `info` is implemented now (the ELF64 loader exists); it must delegate rather
+# than claim NOT IMPLEMENTED, and must describe a real ELF image.
+if ! grep -q 'info <elf>' <<<"$(bash "${WRAPPER}" help)"; then
+    fail "'help' does not advertise the info command"
+fi
+FIXTURE="$(dirname "${BASH_SOURCE[0]}")/../fixtures/tiny-static.elf"
+info_out="$(bash "${WRAPPER}" info "$FIXTURE" 2>&1)" || fail "'info' exited non-zero"
+if grep -q 'NOT IMPLEMENTED' <<<"$info_out"; then
+    fail "'info' printed NOT IMPLEMENTED instead of delegating"
+fi
+grep -q '^type:.*static executable' <<<"$info_out" || fail "'info' did not describe the ELF"
 
 # `run` must delegate to the binary, not print NOT IMPLEMENTED.
 BLOB="$(mktemp)"

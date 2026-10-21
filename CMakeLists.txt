@@ -68,6 +68,7 @@ add_library(hyperion_core
     src/core/translator.cpp
     src/core/runtime_helpers.cpp
     src/core/address_space.cpp
+    src/core/elf.cpp
     src/core/translation_cache.cpp)
 add_library(hyperion::core ALIAS hyperion_core)
 

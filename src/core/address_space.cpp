@@ -103,6 +103,90 @@ bool GuestAddressSpace::map_image(std::uint64_t base, const void* data, std::siz
     return true;
 }
 
+bool GuestAddressSpace::map_segment(std::uint64_t vaddr, const void* data, std::size_t filesz,
+                                    std::size_t memsz, MemPerm perm) {
+    const auto* bytes_in = static_cast<const std::uint8_t*>(data);
+    if (filesz > memsz || memsz == 0) {
+        return false;
+    }
+    // A segment larger than the per-mapping bound is refused for the same reason
+    // an oversized mmap is (see SECURITY.md): the backing store is host memory
+    // and the size is attacker-controlled.
+    if (memsz > max_map_bytes_) {
+        return false;
+    }
+    // Map the whole pages the segment touches: [page_start, end).
+    const std::uint64_t page_start = vaddr & ~kPageMask;
+    const std::uint64_t in_page = vaddr - page_start; // segment offset in its first page
+    if (memsz > std::numeric_limits<std::uint64_t>::max() - in_page) {
+        return false;
+    }
+    const auto span = page_align_up(in_page + memsz);
+    if (!span) {
+        return false;
+    }
+    if (page_start > std::numeric_limits<std::uint64_t>::max() - *span) {
+        return false;
+    }
+    const std::uint64_t end = page_start + *span;
+    const std::uint64_t file_end = vaddr + filesz; // <= vaddr + memsz, no overflow (checked above)
+
+    // Copy the file bytes for [from, to) that belong to this segment, into the
+    // region that owns them. `from`/`to` are guest addresses.
+    const auto copy_file_bytes = [&](Region& region, std::uint64_t from, std::uint64_t to) {
+        if (bytes_in == nullptr) {
+            return;
+        }
+        from = std::max(from, vaddr);
+        to = std::min(to, file_end);
+        if (from >= to) {
+            return;
+        }
+        std::memcpy(region.bytes.data() + (from - region.base), bytes_in + (from - vaddr),
+                    static_cast<std::size_t>(to - from));
+    };
+
+    // First, walk any already-mapped pages the segment overlaps and merge into
+    // them (a linker that does not use `-z separate-code` can put the tail of one
+    // PT_LOAD and the head of the next in the same page). The shared page keeps
+    // its bytes and its permissions become the union of both segments'.
+    std::uint64_t cursor = page_start;
+    while (cursor < end) {
+        const long idx = find_region(cursor);
+        if (idx < 0) {
+            break; // first unmapped page: map the rest in one go below
+        }
+        Region& region = regions_[static_cast<std::size_t>(idx)];
+        const std::uint64_t overlap_end = std::min(end, region.end());
+        copy_file_bytes(region, cursor, overlap_end);
+        region.perm = region.perm | perm; // union: never take access away
+        cursor = overlap_end;
+    }
+
+    if (cursor >= end) {
+        return true; // the whole range was shared with existing mappings
+    }
+
+    // Map the remainder [cursor, end) as a fresh region, zero-filled (BSS) except
+    // for the file bytes copied in.
+    const auto remaining = end - cursor;
+    Region region;
+    region.base = cursor;
+    region.size = remaining;
+    region.perm = perm;
+    auto bytes = try_allocate_bytes(static_cast<std::size_t>(remaining));
+    if (!bytes) {
+        return false;
+    }
+    region.bytes = std::move(*bytes);
+    copy_file_bytes(region, cursor, end);
+
+    regions_.push_back(std::move(region));
+    std::sort(regions_.begin(), regions_.end(),
+              [](const Region& a, const Region& b) { return a.base < b.base; });
+    return true;
+}
+
 std::optional<std::uint64_t> GuestAddressSpace::map_anonymous(std::size_t size, MemPerm perm,
                                                               std::uint64_t hint) {
     if (size == 0) {

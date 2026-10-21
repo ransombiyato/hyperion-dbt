@@ -3,6 +3,7 @@
 **Last updated:** 2026-10-19
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
 Phase 6 (Linux ABI and syscall compatibility) — tenth slice implemented;
+**an ELF64 program-image loader now exists** (`hyperion info`/`run <elf>`);
 Phase 3/4 code generator extended with MOV, ALU and INC/DEC memory operands
 (soft MMU)
 **Repository state:** buildable, tested, documented. **Two execution
@@ -59,6 +60,31 @@ works, what was last verified, and what to do next.
 > `scripts/toolcache.sh restore` (cross toolchain + qemu from `tools/cache/`),
 > then rebuild and rerun the tests. Do **not** trust a surviving `build/`
 > directory. Full details in `docs/agent-handoff.md` §2 and §7.
+
+---
+
+## 0f. ELF64 loader (this increment)
+
+| Work item | State |
+| --- | --- |
+| 1. ELF64 header/program-header parsing | **Done & tested** — `include/hyperion/elf.hpp`, `src/core/elf.cpp`; `parse_elf64()` touches no memory and is directly testable on hostile input |
+| 2. Strict validation with a distinct error per rule | **Done & tested** — `ElfError` has 15 values (bad magic, 32-bit, big-endian, wrong machine, not executable, truncated header, PH table past EOF, `p_filesz > p_memsz`, segment past EOF, incongruent `p_vaddr`/`p_offset`, malformed/absent `PT_INTERP`, no `PT_LOAD`) |
+| 3. Segment mapping into `GuestAddressSpace` | **Done & tested** — `map_segment()` maps whole pages, zero-fills BSS (`p_memsz > p_filesz`), places bytes at the correct in-page offset for an unaligned `p_vaddr`, and merges a page shared with an earlier `PT_LOAD` (union of permissions) |
+| 4. Initial guest stack (argc/argv/envp/auxv) | **Done & tested** — the stack is mapped at the top of the guest address space; `rsp` is 16-byte aligned at entry (the ABI invariant), with argc, the argv pointers, and a NULL argv/envp/auxv terminator |
+| 5. Dynamic executables rejected explicitly | **Done & tested** — a `PT_INTERP` image parses (so `info` can show the interpreter) but `map_elf_image`/`load_elf64` refuse it with `ElfError::kNeedsInterpreter`; it is never loaded and then failing somewhere confusing |
+| 6. `hyperion info <elf>` | **Done** — read-only description: class, type, entry, interpreter, per-segment permissions/vaddr/memsz/filesz, image end |
+| 7. `hyperion run <elf>` | **Done** — ELF detected by magic; the image is mapped and run with the syscall layer enabled. A raw blob keeps the old flat-memory path unchanged |
+| 8. Robustness on untrusted input | **Done & tested** — `elf.survives_random_and_mutated_input` runs 2000 random buffers plus byte-mutations of a valid image through parse+map; clean under ASan/UBSan |
+| 9. CLI test over a committed fixture | **Done** — `tests/cli/elf_test.sh` + `tests/fixtures/tiny-static.elf` (a hand-built static `ET_EXEC` whose only instruction is `hlt`): `info` describes it, both tiers run it in exactly one step, a non-ELF file still takes the blob path, a truncated ELF is rejected with a clear reason |
+
+**What this unlocks, and what it does not.** `hyperion run <real static binary>`
+now loads the image and starts executing it — and then stops at the first
+instruction the small subset does not cover, with an honest `kUnsupported`
+(verified: a real `gcc -static` hello-world loads at its real entry `0x4015c0`,
+sets up `rsp`, and stops at `0x4015c9` — `and rsp, -16` — which the translator
+does not yet lower). It does **not** run real programs; that needs RIP-relative
+addressing, the guest stack (`push`/`pop`/`call`/`ret`), and more syscalls
+(`arch_prctl` FS-base setup in particular). See LIM-020/021 and COMPATIBILITY.md.
 
 ---
 
@@ -444,6 +470,17 @@ twenty-seven numbers in total.
 `openat` is limited to `AT_FDCWD`; every other number returns `-ENOSYS` and is
 counted, never silently ignored.
 
+An **ELF64 program-image loader** now exists (`include/hyperion/elf.hpp`,
+`src/core/elf.cpp`): `parse_elf64()` validates a header and its program headers
+against the file bounds with a distinct error per rule, and `load_elf64()` maps
+the `PT_LOAD` segments into the guest address space, zero-fills BSS, and builds
+the startup stack (argc/argv/envp/auxv) with `rsp` 16-byte aligned at entry.
+`hyperion info <elf>` describes an image read-only; `hyperion run <elf>` maps and
+runs it with the syscall layer enabled. Dynamically linked images are rejected
+with `ElfError::kNeedsInterpreter` rather than loaded and then failing later. A
+real `gcc -static` binary now loads and starts, stopping at the first
+unimplemented instruction with an honest `kUnsupported` — it does not yet run.
+
 The project also installs with a single command:
 
 ```bash
@@ -483,13 +520,22 @@ removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native | `scripts/dev.sh test` | 10/10 ctest passed (195 unit cases, 0 failed, 17 skipped) |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | 6/6 ctest passed (216 unit cases, 0 failed, 2 skipped) |
-| Clang | `scripts/dev.sh clang-build` | 10/10 passed |
-| ASan/UBSan | `scripts/dev.sh sanitize` | 10/10 passed |
+| Native | `scripts/dev.sh test` | 11/11 ctest passed (217 unit cases, 0 failed, 17 skipped) |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | 7/7 ctest passed (unit cases + ELF CLI under qemu) |
+| Clang | `scripts/dev.sh clang-build` | 11/11 passed |
+| ASan/UBSan | `scripts/dev.sh sanitize` | 11/11 passed |
 | Formatting | `scripts/dev.sh format` | clean (clang-format 19.1.7) |
 | Lint | `shellcheck scripts/*.sh tests/cli/*.sh` | clean |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
+
+Re-verified after the **ELF64 loader** increment: native **11/11 ctest** (217
+unit cases, 0 failed, 17 skipped; the new `cli.elf` test included); cross
+**7/7** under `qemu-user`; clang and ASan/UBSan **11/11** each; format clean;
+shellcheck clean (now including `tests/cli/elf_test.sh`). The loader was
+exercised on a real `gcc -static` binary: `hyperion info` printed its four
+`PT_LOAD` segments correctly, and `hyperion run` loaded it at its real entry
+`0x4015c0` and stopped at `0x4015c9` (`and rsp, -16`, not yet lowered) with
+`status: unsupported` — the intended honest result, not a crash.
 
 Re-verified after the **release-packaging** increment (static tarballs + release
 workflow): native **10/10 ctest** (195 unit cases, 0 failed, 17 skipped); cross
@@ -841,31 +887,30 @@ stable-vs-noisy discrimination case).
 reproducibly (`scripts/package.sh`), a tag-triggered workflow publishes them
 with checksums, and both artefacts were executed and verified. Phase 6's tenth
 syscall slice (`statx`) is implemented and tested in both tiers. Phase 5 has six
-accepted, measured optimizations (BENCHMARKS.md §4.2.1–4.2.6).**
+accepted, measured optimizations (BENCHMARKS.md §4.2.1–4.2.6). The ELF64 loader
+is done: `hyperion info`/`run <elf>` load a static image and start it (see §0f).**
 
-The single best next action is now a **code-generator** one, because it is the
-biggest real blocker to running anything from a filesystem and is
-self-contained:
+The single best next action is now a **code-generator** one, because the loader
+made the gap explicit and it is what actually blocks running a real binary:
 
-- **ELF64 loader + `hyperion info`.** There is still no loader, so `hyperion run`
-  only accepts a raw blob. Parse the ELF64 header and program headers, validate
-  them strictly (class, machine, endianness, bounds, `p_filesz <= p_memsz`,
-  no overlapping/invalid `PT_LOAD`), map each `PT_LOAD` into `GuestAddressSpace`
-  with the right permissions, and set up an initial guest stack. Then
-  `hyperion info <elf>` describes an image, and `hyperion run <elf>` maps it.
-  This is a prerequisite for the ISO question's *user-mode* reading (see
-  `docs/iso-boot-investigation.md`) and for Phase 9. Test with a tiny
-  hand-written static ELF plus a real `gcc -static` hello-world (which will
-  still stop at the first unsupported instruction — that is an honest
-  `kUnsupported`, not a crash).
+- **The guest stack (`push`/`pop`/`call`/`ret` with `rsp`).** A real static
+  binary's `_start` begins with `xor ebp,ebp; mov r9,rdx; pop rsi; mov rdx,rsp;
+  and rsp,-16; push rax; push rsp; …; call __libc_start_main`. Hyperion loads it
+  and stops at `and rsp,-16` (`0x4015c9`) — it does not lower `and r64, imm`, and
+  more importantly `pop`/`push`/`call`/`ret` do not exist yet. Implement them with
+  `rsp` as an ordinary guest register in the effective-address path (a soft-MMU
+  load/store at `rsp`, then the pointer adjust), keep the reference interpreter
+  as the oracle, and add a focused differential per form plus a whole-program
+  differential for a `call`/`ret` round trip. This is the increment that turns
+  "blocks" into "programs".
 
 Then, in parallel and also code-gen:
 
 - **RIP-relative addressing** (`mov rax, [rip+disp]`), which the decoder still
   rejects (`kUnsupportedOperand`). Ubiquitous in position-independent code, so
   the biggest single decoder gap, and a small self-contained change.
-- **The guest stack** (`push`/`pop`/`call`/`ret` with rsp), which is what turns
-  "blocks" into "programs".
+- **`and r64, imm` / the remaining ALU immediates** in the translator, which is
+  literally the instruction the real `_start` stops on.
 
 Then, larger Phase 6/7 work (independent):
 

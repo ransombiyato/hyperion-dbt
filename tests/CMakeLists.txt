@@ -23,7 +23,8 @@ add_executable(hyperion_unit_tests
     unit/test_interpreter.cpp
     unit/test_syscall.cpp
     unit/test_runtime_helpers.cpp
-    unit/test_address_space.cpp)
+    unit/test_address_space.cpp
+    unit/test_elf.cpp)
 target_link_libraries(hyperion_unit_tests PRIVATE hyperion_test_harness)
 
 add_test(NAME unit.native COMMAND hyperion_unit_tests)
@@ -36,6 +37,16 @@ add_test(NAME unit.native COMMAND hyperion_unit_tests)
 add_test(NAME cli.smoke
     COMMAND ${CMAKE_COMMAND} -E env bash
             "${CMAKE_CURRENT_SOURCE_DIR}/cli/cli_smoke.sh" $<TARGET_FILE:hyperion>)
+
+# --- ELF-path CLI test ------------------------------------------------------
+#
+# `hyperion info`/`run` on a real (if tiny) ELF64 image, plus the two failure
+# paths a user hits: a non-ELF file and a truncated ELF.
+add_test(NAME cli.elf
+    COMMAND ${CMAKE_COMMAND} -E env bash
+            "${CMAKE_CURRENT_SOURCE_DIR}/cli/elf_test.sh"
+            $<TARGET_FILE:hyperion>
+            "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tiny-static.elf")
 
 # --- `hyperion` wrapper test ------------------------------------------------
 #

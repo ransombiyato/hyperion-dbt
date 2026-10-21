@@ -54,6 +54,28 @@ variable-length byte streams. Requirements:
 - Invalid encodings produce an explicit error, never undefined behaviour.
 - Fuzz-tested from Phase 2 (see `TESTING.md` §8).
 
+### R2b — Memory-safe image loading
+The ELF64 loader (`src/core/elf.cpp`) is the second attack surface: an ELF image
+is attacker-controlled bytes. Requirements:
+
+- Parsing is separated from mapping. `parse_elf64()` reads only the file buffer,
+  validates every field and program header against the actual file length
+  (including `p_filesz <= p_memsz` and `p_offset + p_filesz <= filesize`), and
+  allocates nothing; a malformed image yields a distinct `ElfError`, never
+  undefined behaviour or a partial mapping.
+- Segment mapping goes through `GuestAddressSpace`, so the same per-mapping size
+  bound (R5) and the same page-granular permission checks apply as for `mmap`.
+- A **dynamically linked** image is refused (`ElfError::kNeedsInterpreter`)
+  rather than loaded, because loading it would need a userspace dynamic loader
+  that does not exist here.
+- Robustness is tested on hostile input: a bounded deterministic pseudo-fuzz
+  (`elf.survives_random_and_mutated_input`) plus one unit case per rejection rule,
+  clean under ASan/UBSan.
+
+The loader is **not** a sandbox and does **not** validate the program's intent;
+it only guarantees that the image is internally consistent and maps inside the
+guest address space. See §4.
+
 ### R3 — Generated code is produced, never imported
 The translator emits code only from validated IR through its own code
 generator. It never `mmap`s guest bytes as executable and never `exec`s a guest

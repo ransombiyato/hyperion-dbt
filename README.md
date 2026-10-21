@@ -81,10 +81,13 @@ CMakePresets.json       Standard configure/build/test presets
 cmake/toolchains/       AArch64 cross-compilation toolchain file
 include/hyperion/       Public headers
 src/core/               Core library (host probe, decoder, interpreter,
-                        AArch64 encoder, executable memory, translator)
+                        AArch64 encoder, executable memory, translator,
+                        address space, ELF64 loader)
 src/cli/                Command-line entry point
 tests/harness/          Dependency-free C++ test harness
 tests/unit/             Unit tests
+tests/cli/              End-to-end CLI tests (blob path, ELF path, wrapper)
+tests/fixtures/         Small committed test inputs (e.g. a tiny static ELF)
 tests/run_cross_tests.cmake  Cross-arch validation driver
 tests/bench_rejects_bad_args.cmake  Negative test for the benchmark harness
 benchmarks/             Benchmark harness
@@ -137,6 +140,7 @@ hyperion doctor    # check the host, toolchain and install
 hyperion status    # what is implemented, and what is not
 hyperion test      # run the test suite
 hyperion bench     # run the benchmark harness
+hyperion info ELF  # describe an ELF64 executable (read-only)
 hyperion help      # every command
 ```
 
@@ -179,14 +183,20 @@ The packaged AArch64 binary is a real translator, not a stub: under
 three-instruction blob (`--tier=1`). No target-device performance number is
 claimed, because none has been measured (see `BENCHMARKS.md`).
 
-> **`hyperion run` works, with a small instruction subset.** It loads a
-> flat x86-64 blob (not an ELF executable — there is no ELF loader yet),
-> translates it basic block by basic block into AArch64, and executes it. On an
-> x86-64 host, where generated AArch64 code cannot run, it says so on stderr and
-> falls back to the reference interpreter. `--tier=0` forces the interpreter,
-> `--tier=1` forces generated code. Because there is no ELF loader, no block
-> chaining and no cache invalidation yet, no real Linux program runs end to end.
-> `hyperion bench` measures the host machine, not any emulation.
+> **`hyperion run` works, with a small instruction subset.** It accepts either a
+> raw flat x86-64 blob (loaded at `0x400000`) or an **ELF64 executable**, which it
+> detects by magic, maps from its `PT_LOAD` segments and gives a startup stack;
+> `hyperion info <elf>` describes an image without running it. It translates the
+> code basic block by basic block into AArch64 and executes it. On an x86-64 host,
+> where generated AArch64 code cannot run, it says so on stderr and falls back to
+> the reference interpreter. `--tier=0` forces the interpreter, `--tier=1` forces
+> generated code. Only **static** images are loaded (a dynamically linked one is
+> refused with a clear reason — there is no userspace dynamic loader). A real
+> `gcc -static` binary now loads and starts, then stops at the first instruction
+> outside the subset with an honest "unsupported", so **no real Linux program runs
+> end to end** yet: the guest stack (`push`/`pop`/`call`/`ret`) and RIP-relative
+> addressing are still missing. `hyperion bench` measures the host machine, not
+> any emulation.
 
 ### Build from source
 

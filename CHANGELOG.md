@@ -5,6 +5,53 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — ELF64 program-image loader (`hyperion info` / `run <elf>`)
+
+### Added
+- **`include/hyperion/elf.hpp`, `src/core/elf.cpp`** — an ELF64 program-image
+  loader. `parse_elf64()` validates the header and program headers against the
+  file bounds and returns a distinct `ElfError` per rule (bad magic, 32-bit,
+  big-endian, wrong machine, not an executable, truncated header, program-header
+  table past EOF, `p_filesz > p_memsz`, segment bytes past EOF, incongruent
+  `p_vaddr`/`p_offset`, malformed or absent `PT_INTERP`, no `PT_LOAD`). It
+  touches no memory, so it is directly testable on hostile input.
+  `map_elf_image()`/`load_elf64()` map the `PT_LOAD` segments into the guest
+  address space, zero-fill BSS, and build the startup stack (argc/argv/envp/auxv)
+  with `rsp` 16-byte aligned at entry, as the ABI requires. A dynamically linked
+  image (one with `PT_INTERP`) is refused with `ElfError::kNeedsInterpreter`
+  rather than loaded and then failing later.
+- **`GuestAddressSpace::map_segment()`** — maps a loaded segment at an arbitrary
+  (not necessarily page-aligned) `vaddr`: it maps the whole pages the segment
+  touches, places the file bytes at the correct in-page offset, zero-fills the
+  rest, and merges a page shared with an earlier `PT_LOAD` (union of permissions,
+  keeping the earlier bytes).
+- **`hyperion info <elf>`** — read-only description of an image: class, type,
+  entry point, interpreter, per-segment permissions/vaddr/memsz/filesz, image end.
+- **`hyperion run <elf>`** — detects an ELF by magic, maps it, and runs it with
+  the guest syscall layer enabled. A raw blob keeps the previous flat-memory path.
+- **`tests/unit/test_elf.cpp`** — 17 parser/mapper cases plus a bounded,
+  deterministic robustness test (2000 random buffers and byte-mutations of a
+  valid image through parse+map).
+- **`tests/cli/elf_test.sh`** + **`tests/fixtures/tiny-static.elf`** — drives
+  `info`/`run` over a committed hand-built static ELF (both tiers, exactly one
+  retired instruction), and checks that a non-ELF file still takes the blob path
+  and a truncated ELF is rejected with a clear reason.
+
+### Changed
+- `src/cli/main.cpp`: `run` is now ELF-aware; added the `info` command.
+- `include/hyperion/address_space.hpp`: `map_segment` takes a `vaddr` that need
+  not be page-aligned and documents the page-sharing merge.
+- `tests/CMakeLists.txt`: registers `unit/test_elf.cpp` and the `cli.elf` test.
+
+### Notes
+- A real `gcc -static` binary now **loads** (`hyperion info` shows its four
+  `PT_LOAD` segments) and **starts** at its true entry (`0x4015c0`), then stops at
+  `0x4015c9` (`and rsp, -16`) with `status: unsupported`. It does not run real
+  programs yet: the guest stack (`push`/`pop`/`call`/`ret`), RIP-relative
+  addressing and the remaining ALU immediates are the blockers (LIM-020).
+
+---
+
 ## [Unreleased] — Distribution: prebuilt static binaries and a release workflow
 
 ### Added

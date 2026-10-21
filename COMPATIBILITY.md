@@ -297,6 +297,31 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 
 ---
 
+## 5.1 Program loading (ELF64) and process startup
+
+| Feature | Status | Phase | Covering test |
+| --- | --- | --- | --- |
+| ELF64 header validation (class, data, version, machine, type) | ✅ | 6 | `elf.rejects_bad_magic`/`_32_bit_image`/`_big_endian_image`/`_a_non_x86_64_machine`/`_a_relocatable_object`/`_a_truncated_file` |
+| Program-header table bounds | ✅ | 6 | `elf.rejects_a_program_header_table_past_eof` |
+| `PT_LOAD` bounds (`p_filesz <= p_memsz`, bytes past EOF, `p_vaddr ≡ p_offset`) | ✅ | 6 | `elf.rejects_filesz_greater_than_memsz`/`_segment_bytes_past_eof`/`_an_unaligned_segment` |
+| Segment mapping (permissions, BSS zero-fill, unaligned `vaddr`, page sharing) | ✅ | 6 | `elf.maps_a_static_image_and_sets_up_the_stack`, `address_space.map_segment_*` |
+| Startup stack (argc/argv/envp, 16-byte-aligned `rsp`) | ✅ | 6 | `elf.maps_a_static_image_and_sets_up_the_stack` |
+| `hyperion info <elf>` / `run <elf>` | ✅ | 6 | `cli.elf` |
+| Hostile-input robustness (parse + map) | ✅ | 6 | `elf.survives_random_and_mutated_input` |
+| Dynamic linking (`PT_INTERP`, shared objects, relocations) | ⬜ (refused explicitly) | 6 | `elf.detects_a_dynamic_interpreter` |
+| `auxv` contents (`AT_*` entries) | ⬜ (only `AT_NULL` emitted) | 6 | — |
+| Environment variables in the startup stack | ⬜ (empty env) | 6 | — |
+| Non-`PT_LOAD` program headers (`PT_PHDR`, `PT_GNU_STACK`, …) | ⬜ (ignored) | 6 | — |
+
+A **dynamically linked** executable is parsed (so `info` can print its
+interpreter) but refused by the loader with `ElfError::kNeedsInterpreter`: there
+is no userspace dynamic loader, and loading it anyway would fail somewhere
+confusing. The startup `auxv` is currently a single `AT_NULL` pair, so a program
+that reads `AT_PAGESZ`/`AT_HWCAP`/… sees an empty vector — a documented gap, not
+a wrong value.
+
+---
+
 ## 6. Host forwarding
 
 | Capability | Status | Phase |

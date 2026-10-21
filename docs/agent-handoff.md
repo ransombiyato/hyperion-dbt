@@ -77,8 +77,16 @@ stack (`push`/`pop`/`ret`) is still *refused explicitly* rather than miscompiled
 forms, the ALU read-modify-write forms (`add/sub/and/or/xor/cmp r,[m]` and
 `... [m],r`) and `inc/dec [m]` lower to soft-MMU runtime helpers
 (`hyperion_load`/`hyperion_store`), and a faulting access exits the block as
-`kMemoryFault`. The interpreter remains the only *complete* execution
-path. Phase 5 continues with block chaining; `STATUS.md` §4 lists the steps.
+`kMemoryFault`. An **ELF64 loader** now exists (`include/hyperion/elf.hpp`,
+`src/core/elf.cpp`): `hyperion info <elf>` describes a static image read-only and
+`hyperion run <elf>` maps its `PT_LOAD` segments, zero-fills BSS, builds the
+startup stack with `rsp` 16-byte aligned, and starts it. Only **static** images
+load; a `PT_INTERP` image is refused with `ElfError::kNeedsInterpreter`. A real
+`gcc -static` binary therefore loads and starts, then stops at `0x4015c9`
+(`and rsp,-16`) with an honest `kUnsupported` — the guest stack
+(`push`/`pop`/`call`/`ret`) and RIP-relative addressing are still missing, so no
+real program runs end to end (LIM-020). The interpreter remains the only
+*complete* execution path. `STATUS.md` §4 lists the steps.
 
 **Two real defects were found and fixed in Phase 4**, both by testing: a block
 whose *first* instruction was unsupported was emitted empty and made the
@@ -196,12 +204,15 @@ the seventh (`access`/`readlink`), the eighth (`readlinkat`), the ninth
 Memory operands are now translated in Tier 1 (MOV, ALU read-modify-write,
 INC/DEC, all via soft-MMU helpers), and the project now **ships prebuilt static
 binaries** (`scripts/package.sh`, `.github/workflows/release.yml`) that were
-verified to execute generated code under `qemu-user`. The next concrete
-code-generation step is an **ELF64 loader** (there is still no way to load a real
-executable; STATUS.md §4), followed by **RIP-relative addressing** (`[rip+disp]`),
-which the decoder still rejects and which real position-independent code uses
-constantly; the next syscall step is the remaining U4/E1 syscalls a real program
-needs to start (`arch_prctl`, `set_tid_address`, `rseq`).** Guest state, the
+verified to execute generated code under `qemu-user`. An **ELF64 loader** now
+exists: `hyperion info <elf>` describes a static image read-only and
+`hyperion run <elf>` maps its `PT_LOAD` segments, builds the startup stack, and
+starts it (a dynamically linked image is refused with a clear reason). The next
+concrete code-generation step is the **guest stack** (`push`/`pop`/`call`/`ret`),
+without which a real `_start` stops at `and rsp,-16`; then **RIP-relative
+addressing** (`[rip+disp]`), which the decoder still rejects. The next syscall
+step is the remaining U4/E1 syscalls a real program needs to start
+(`arch_prctl`, `set_tid_address`, `rseq`).** Guest state, the
 decoder, the reference interpreter, the subset contract (`COMPATIBILITY.md` §2),
 the hardware differential, the AArch64 encoder, executable memory,
 single-instruction translation, whole-block translation, the translation-cache
@@ -310,7 +321,27 @@ and pass.
 16. ~~Implement `statx`(332).~~ **Done & tested.** `struct statx` is all
     fixed-width fields, so the host bytes are forwarded verbatim (D-030);
     `AT_FDCWD` only. Six new tests (27 of 375 implemented).
-17. **Next (Phase 6): the remaining U4/E1 syscalls a real program needs to
+17. ~~Build the ELF64 loader.~~ **Done & tested.** `include/hyperion/elf.hpp`,
+    `src/core/elf.cpp`: `parse_elf64()` validates header + program headers
+    against the file bounds with a distinct `ElfError` per rule and touches no
+    memory; `load_elf64()` maps `PT_LOAD` segments into `GuestAddressSpace`
+    (BSS zero-filled, unaligned `p_vaddr` placed at the right in-page offset,
+    shared pages merged), builds the startup stack with `rsp` 16-byte aligned,
+    and refuses a `PT_INTERP` image. `hyperion info <elf>` and ELF-aware
+    `hyperion run <elf>` added. 17 parser/mapper unit cases + a deterministic
+    hostile-input robustness test + the `cli.elf` end-to-end test (D-033). A real
+    `gcc -static` binary loads at its true entry and stops at `0x4015c9`
+    (`and rsp,-16`) with an honest `kUnsupported` (LIM-020).
+18. **Next (Phase 3/4): the guest stack (`push`/`pop`/`call`/`ret`).** Model
+    `rsp` as an ordinary guest register in the effective-address path: a
+    soft-MMU load/store at `rsp`, then the pointer adjust (push decrements
+    before the store, pop loads before the increment). `call`/`ret` are a push
+    or pop of the return address plus a control transfer; keep the authoritative
+    `rip` rule and the interpreter as the oracle. Add a focused differential per
+    form and a whole-program `call`/`ret` round-trip differential. This is what
+    turns blocks into programs; without it a real `_start` stops at `and rsp,-16`
+    (which itself needs the remaining ALU immediates — see item 20).
+19. **Next (Phase 6): the remaining U4/E1 syscalls a real program needs to
     start.** `arch_prctl`(158) (FS/GS base — needed before glibc startup, and the
     one that needs a new `GuestState.fs_base` field), `set_tid_address`(218),
     `rseq`(334) and `prlimit64`(302). Reuse the `newfstatat`/`fstat` shared guest-`struct stat` builder
@@ -319,7 +350,7 @@ and pass.
     number's `status` in `docs/syscalls/inventory.tsv` to `implemented`,
     regenerate (`python3 tools/gen_syscall_inventory.py`), add a focused test per
     call, and update STATUS.md §0e.
-17. ~~(Phase 6/7): memory operands in the code generator.~~ **MOV, ALU
+20. ~~(Phase 6/7): memory operands in the code generator.~~ **MOV, ALU
     read-modify-write and INC/DEC memory operands are done** (soft-MMU helpers;
     `translator.differential_memory_operands` and
     `translator.differential_alu_memory_operands` run under `qemu-user`). The next
@@ -329,7 +360,7 @@ and pass.
     real. It is a small decoder change (ModRM `mod=00`, `rm=101`) plus an
     effective-address case that adds the *next instruction's* address to the
     displacement; require a focused differential.
-18. **Also open (Phase 5): block chaining.** Today every block exit returns to
+21. **Also open (Phase 5): block chaining.** Today every block exit returns to
     the dispatcher for a lookup. Link a block's exit directly to its successor's
     generated code so a hot loop stays in generated code, guarded by the same
     authoritative-`rip` rule, with the dispatcher as the fallback for any
@@ -339,11 +370,11 @@ and pass.
     make a candidate look good. Add a deterministic guard for whatever the
     change should move (e.g. dispatcher lookups per run), since `qemu-user`
     timing is noisy (DECISIONS.md D-020).
-17. **Keep the oracle.** Run each multi-instruction program through both the
+22. **Keep the oracle.** Run each multi-instruction program through both the
     generated blocks and the interpreter's `run_program`, and require the final
     `GuestState` to match bit-for-bit. A mismatch must fail loudly; there is no
     tolerance for "close enough".
-18. Everything runs on the real AArch64 path for free: the `cross.aarch64_tests`
+23. Everything runs on the real AArch64 path for free: the `cross.aarch64_tests`
     pipeline builds the tests for AArch64, runs them under `qemu-user`, and runs
     the CLI smoke test with `HYPERION_EMULATOR`, so generated code is exercised in
     CI without the target device.

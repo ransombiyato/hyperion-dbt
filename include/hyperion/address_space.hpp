@@ -75,6 +75,28 @@ public:
     // range is invalid, misaligned, or overlaps an existing mapping.
     bool map_image(std::uint64_t base, const void* data, std::size_t size, MemPerm perm);
 
+    // Map a loaded segment: `memsz` bytes starting at guest address `vaddr`, of
+    // which the first `filesz` are copied from `data` and the remainder is zero
+    // (BSS). The mapping is page-granular, so `vaddr` need not be page-aligned
+    // (a PT_LOAD's `p_vaddr` only has to satisfy `p_vaddr ≡ p_offset (mod
+    // p_align)`, and the last segment of a real binary usually is not aligned);
+    // the containing page is mapped and the bytes placed at their offset within
+    // it.
+    //
+    // A segment may share a page with an already-mapped segment (a linker that
+    // does not use `-z separate-code` can put the tail of one PT_LOAD and the
+    // head of the next in one page). Sharing is handled by *merging*: the shared
+    // page keeps its bytes and its permissions become the union of both
+    // segments'. Union never under-permits; for a page that would be both
+    // writable and executable it is a deliberate W^X relaxation, noted in
+    // docs/known-issues.md. Binaries linked with `-z separate-code` (the modern
+    // default) have no shared pages, so no relaxation occurs.
+    //
+    // Returns false if the range is invalid, overflows, exceeds the per-mapping
+    // bound, or cannot be allocated; a failed call maps nothing.
+    bool map_segment(std::uint64_t vaddr, const void* data, std::size_t filesz, std::size_t memsz,
+                     MemPerm perm);
+
     // Anonymous mapping of `size` bytes (rounded up to a page) with `perm`.
     // When `hint` is non-zero and free, it is used; otherwise the allocator
     // picks the next free page at or above its cursor. Returns the base address,

@@ -84,8 +84,8 @@ paths
   build-dir     print the build tree path
 
 translator
-  run <exe>     execute a raw x86-64 code blob (tier 0/1)
-  info <exe>    describe an x86-64 executable [NOT IMPLEMENTED]
+  run <file>    execute a raw x86-64 code blob or a static ELF64 executable
+  info <elf>    describe an ELF64 executable (read-only)
 
   help          show this message
 
@@ -127,17 +127,21 @@ IMPLEMENTED
     soft-MMU runtime helper, with a fault reported rather than miscompiled
   - per-block guest-register allocation
   - a slice of Linux syscalls (see 'hyperion doctor' / STATUS.md)
+  - an ELF64 loader: 'hyperion info <elf>' and 'hyperion run <elf>' (static
+    images only; a dynamically linked one is refused with a clear reason)
 
 NOT IMPLEMENTED
-  - loading a real ELF executable (only raw code blobs run)
+  - running a real Linux program end to end (a loaded image stops at the first
+    instruction outside the subset)
   - push/pop/call/ret, RIP-relative addressing, SIMD
+  - dynamic linking, auxv entries, environment variables
   - block chaining, cache invalidation, signals, threads
-  - the `info` command
 
-A raw x86-64 code blob runs with 'hyperion run <file>' (tier 1 on an AArch64
-host, tier 0 otherwise). A real Linux ELF program cannot run yet. 'hyperion
-bench' measures the host machine, not any emulation. See STATUS.md and
-ROADMAP.md in the source checkout for the full picture.
+'hyperion run <file>' accepts a raw x86-64 code blob or a static ELF64
+executable (tier 1 on an AArch64 host, tier 0 otherwise). A real Linux ELF
+program loads and starts, but does not run to completion yet. 'hyperion bench'
+measures the host machine, not any emulation. See STATUS.md and ROADMAP.md in
+the source checkout for the full picture.
 EOF
 }
 
@@ -231,19 +235,18 @@ cmd_clean() {
     rm -rf "${BUILD}"
 }
 
-not_implemented() {
-    say "NOT IMPLEMENTED: $1"
-    say ""
-    say "A raw x86-64 code blob can be run with 'hyperion run <file>', but this"
-    say "command needs a real x86-64 ELF program. See ROADMAP.md."
-    exit 2
-}
-
 cmd_run() {
     need_build
     local bin="${BUILD}/hyperion"
     [ -x "${bin}" ] || die "hyperion binary not found at '${bin}' (run: hyperion build)"
     exec "${bin}" run "$@"
+}
+
+cmd_info() {
+    need_build
+    local bin="${BUILD}/hyperion"
+    [ -x "${bin}" ] || die "hyperion binary not found at '${bin}' (run: hyperion build)"
+    exec "${bin}" info "$@"
 }
 
 case "${1:-}" in
@@ -260,6 +263,6 @@ case "${1:-}" in
     src)                say "${SRC}" ;;
     build-dir)          say "${BUILD}" ;;
     run)                shift; cmd_run "$@" ;;
-    info)               not_implemented "inspecting x86-64 executables" ;;
+    info)               shift; cmd_info "$@" ;;
     *)                  printf 'error: unknown command %s\n\n' "$1" >&2; cmd_help >&2; exit 1 ;;
 esac

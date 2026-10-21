@@ -54,7 +54,8 @@ Presets are also provided: `cmake --preset debug`, `release`, `sanitize`,
 | `tests/harness/` | dependency-free harness (`HYPERION_TEST`, `HYPERION_CHECK`) |
 | `tests/unit/` | unit tests, one file per component |
 | `tests/differential/` | interpreter vs. real x86-64 hardware |
-| `tests/cli/` | end-to-end CLI smoke test (`cli_smoke.sh`) |
+| `tests/cli/` | end-to-end CLI tests (`cli_smoke.sh` for the blob path, `elf_test.sh` for the ELF path, `wrapper_test.sh` for the installed `hyperion` command) |
+| `tests/fixtures/` | small committed test inputs (`tiny-static.elf`) |
 | `tests/run_cross_tests.cmake` | cross-arch configure/build/run driver |
 | `benchmarks/` | harness smoke tests (`bench.smoke`, `tier_bench.smoke`) |
 
@@ -64,7 +65,8 @@ Registered CTest tests:
 | --- | --- |
 | `unit.native` | core components behave correctly on the host |
 | `differential.native_vs_interpreter` | the interpreter agrees with real x86-64 |
-| `cli.smoke` | `hyperion run` executes through both tiers and they agree |
+| `cli.smoke` | `hyperion run` executes a blob through both tiers and they agree |
+| `cli.elf` | `hyperion info`/`run` load and execute a static ELF64 image; a non-ELF file still takes the blob path; a truncated ELF is rejected with a clear reason |
 | `bench.smoke` | the benchmark harness runs and emits valid output |
 | `tier_bench.smoke` | the Tier 0 vs Tier 1 benchmark runs and both tiers are correct (on x86-64 only Tier 0 executes; Tier 1 is reported unavailable) |
 | `cross.aarch64_tests` | the suite passes when compiled for AArch64 and run under `qemu-user` |
@@ -75,6 +77,19 @@ execute generated code, tier 1 falls back to the interpreter (and says so); the
 cross pipeline runs the same script with `HYPERION_EMULATOR` set to `qemu-aarch64`
 and additionally requires tier 1 to have translated a non-zero number of blocks,
 so a vacuous "ok" cannot pass.
+
+`tests/cli/elf_test.sh` runs the same two-tier check over `tests/fixtures/tiny-static.elf`,
+a hand-built static `ET_EXEC` whose only instruction is `hlt` at its entry
+(`0x401000`): a successful run is exactly one retired instruction with `rip` at
+the entry. It also pins the two failure paths a user hits — a file without the
+ELF magic must still take the raw-blob path, and a truncated ELF must be rejected
+with a clear reason rather than crashing.
+
+The ELF parser handles untrusted input, so `tests/unit/test_elf.cpp` includes
+`elf.survives_random_and_mutated_input`: a bounded, deterministic pseudo-fuzz
+(2000 random buffers plus byte-mutations of a valid image through parse and map).
+It is reproducible from its seed, and under ASan/UBSan any out-of-bounds access
+becomes a test failure. A real libFuzzer target can replace it later.
 
 ### Writing a test
 

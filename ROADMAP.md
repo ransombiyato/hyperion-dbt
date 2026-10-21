@@ -6,7 +6,8 @@ demonstrated by evidence**, not merely by the existence of code.
 Status legend: ✅ complete · 🟡 in progress · ⬜ not started
 
 **Overall: Phases 0–1 complete; Phases 2–6 in progress (Phase 6 has ten
-syscall slices landed, and Tier 1 now translates MOV, ALU and INC/DEC memory operands).**
+syscall slices landed and an ELF64 loader, and Tier 1 now translates MOV, ALU
+and INC/DEC memory operands).**
 
 | Phase | Title | Status |
 | --- | --- | --- |
@@ -390,10 +391,22 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   `rip` on the faulting instruction. Executed and compared against the
   interpreter under `qemu-user`
   (`translator.differential_alu_memory_operands`, `..._fault_is_reported`).
-- ⬜ RIP-relative addressing (`[rip+disp]`) -- **next**; the decoder still
-  rejects it, and it is ubiquitous in real position-independent code.
-- ⬜ The guest stack (`push`/`pop`/`call`/`ret`) and block chaining /
-  cache invalidation (Phase 4).
+- ✅ **ELF64 program-image loader.** `parse_elf64()` validates a static
+  executable's header and program headers against the file bounds with a
+  distinct error per rule; `load_elf64()` maps the `PT_LOAD` segments into the
+  guest address space (BSS zero-filled, an unaligned `p_vaddr` placed at the
+  right in-page offset) and builds the startup stack with `rsp` 16-byte aligned
+  at entry (D-033). `hyperion info <elf>` describes an image read-only and
+  `hyperion run <elf>` maps and runs it. A dynamically linked image is refused
+  with `ElfError::kNeedsInterpreter`. Tested with 17 parser/mapper unit cases, a
+  hostile-input robustness test, and the `cli.elf` end-to-end test over a
+  committed static fixture.
+- ⬜ The guest stack (`push`/`pop`/`call`/`ret`) -- **next**; a real static
+  `_start` stops at `and rsp,-16` without it.
+- ⬜ RIP-relative addressing (`[rip+disp]`); the decoder still rejects it, and it
+  is ubiquitous in real position-independent code.
+- ⬜ The remaining ALU immediates (`and r64, imm`), block chaining / cache
+  invalidation (Phase 4).
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.

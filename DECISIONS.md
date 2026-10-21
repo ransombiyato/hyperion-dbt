@@ -855,3 +855,50 @@ is still refused, not mistranslated. The cost is a helper call per access
 (LIM-017); a fast path for identity-mapped regions or a host-page cache is
 Phase 5 optimization work, and it must preserve the single-definition property
 above. `push`/`pop`/`ret` remain interpreter-only until a guest stack is mapped.
+
+---
+
+## D-033 — ELF64 loading is a separate, strictly-validating step; static images only
+
+**Context.** Until now `hyperion run` accepted a raw x86-64 code blob copied at
+a fixed base address. Running a real program needs an ELF executable loaded from
+its program headers: the `PT_LOAD` segments mapped at their own virtual
+addresses with their own permissions, BSS zero-filled, and a startup stack with
+argc/argv/envp/auxv so `_start` has something to read. The file is untrusted
+input, so the loader is an attack surface (SECURITY.md).
+
+**Decision.** Parsing and mapping are two functions, not one.
+
+- `parse_elf64()` reads only the byte buffer. It validates the ELF class, data
+  encoding, version, machine, type, header sizes, and every program header
+  (bounds against the file, `p_filesz <= p_memsz`, `p_vaddr ≡ p_offset (mod
+  p_align)`), and returns a distinct `ElfError` per rule. It allocates nothing
+  and maps nothing, so it cannot fail half-way through a mapping and it is
+  directly unit-testable on hostile input.
+- `map_elf_image()`/`load_elf64()` map the parsed segments into a
+  `GuestAddressSpace`, zero-fill BSS, and build the startup stack with `rsp`
+  16-byte aligned at entry. A refused segment fails the whole load (no partial
+  image).
+
+`GuestAddressSpace::map_segment()` maps whole pages but takes a `vaddr` that
+need not be page-aligned (a real binary's last `PT_LOAD` usually is not): it
+places the file bytes at their in-page offset and zero-fills the rest. A page
+shared with an earlier `PT_LOAD` is *merged* (earlier bytes kept, permissions
+unioned) rather than rejected; this is a deliberate W^X relaxation, and it does
+not occur for binaries linked with `-z separate-code` (the modern default).
+
+**Why not one combined load-and-map, and why not dynamic linking.** Separating
+the steps is what makes the hostile-input testing meaningful and keeps the
+"never a partial mapping" property. Dynamic linking needs a userspace dynamic
+loader (a whole additional subsystem); an image with `PT_INTERP` is instead
+refused with `ElfError::kNeedsInterpreter`, so the failure is named at load time
+rather than surfacing as a mystery later.
+
+**Consequences.** `hyperion info <elf>` describes an image read-only, and
+`hyperion run <elf>` loads and runs a static image with the syscall layer
+enabled; a raw blob keeps the previous path unchanged. A real `gcc -static`
+binary loads at its true entry and stops at the first instruction the subset
+does not cover with an honest `kUnsupported` — the loader does not pretend the
+program runs (LIM-020). The startup `auxv` is currently terminated with a NULL
+pair rather than filled with real entries; a program that reads `AT_*` will see
+an empty vector, which is a documented next step, not a silent wrong value.
