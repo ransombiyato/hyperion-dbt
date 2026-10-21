@@ -42,6 +42,14 @@ no shared libraries, no root). The packaged AArch64 binary was verified under
 `qemu-user` to really translate and execute (`--tier=1`, one block, `rax=3`).
 See README "Getting a binary without building anything".
 
+**First pre-release published:** tag `v0.1.0-experimental` →
+<https://github.com/ransombiyato/hyperion-dbt/releases/tag/v0.1.0-experimental>.
+The `release` workflow run for that tag is green; the three assets were
+re-downloaded from GitHub, `sha256sum -c SHA256SUMS` passed, and the downloaded
+AArch64 binary was executed under `qemu-aarch64` (`1 basic block(s) translated`,
+`rax=0x0000000000000003`). It is marked **pre-release** deliberately: it does
+not run a real Linux program (LIM-020/021).
+
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
 

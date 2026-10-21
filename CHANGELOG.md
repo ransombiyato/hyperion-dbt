@@ -19,6 +19,8 @@ Meaningful changes by milestone. Format loosely follows
   tests), packages both architectures, smoke-tests the packaged binaries
   (including the AArch64 one under `qemu-user` with a real `--tier=1`
   translation), verifies the checksums, and publishes a GitHub pre-release.
+  First exercised for tag `v0.1.0-experimental` (run green; assets
+  re-downloaded and verified).
 - **`hyperion package`** — wrapper command for `scripts/package.sh`.
 - **`docs/iso-boot-investigation.md`** — records the ISO/boot experiment and its
   honest negative result (see Changed).
