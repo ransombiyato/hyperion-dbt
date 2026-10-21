@@ -119,7 +119,8 @@ usually broken, and this project requires evidence, not plausible numbers.
 
 > **The environment does not persist.** A new session starts with no toolchain in
 > `/usr`. The **repository directory does persist**, so a tool cache lives at
-> `tools/cache/` (git-ignored): recover with `scripts/toolcache.sh restore`
+> `tools/cache/` (the tarball and qemu binary are committed): recover with
+> `scripts/toolcache.sh restore`
 > (offline) and only then `scripts/bootstrap.sh` if a tool is still missing. Do
 > not treat a stale `build/` directory as evidence that tests pass — rerun them.
 >
@@ -128,8 +129,8 @@ usually broken, and this project requires evidence, not plausible numbers.
 > other's history:
 >
 > 1. `scripts/toolcache.sh restore` — the AArch64 cross toolchain and
->    `qemu-aarch64-static`, from the git-ignored `tools/cache/`. Only present if
->    the workspace directory carried over. Needed only for `cross-test`.
+>    `qemu-aarch64-static`, from the committed `tools/cache/` (both artefacts are
+>    in Git, so this works from a fresh clone). Needed only for `cross-test`.
 > 2. `scripts/toolcache.sh install-host` — `cmake`, `ninja` and `shellcheck`,
 >    from the `.deb` files **committed** under `tools/vendor/host-debs/`. This
 >    works from a fresh clone and needs no network for those three packages.

@@ -663,7 +663,9 @@ commit `454c546`): native 125/0, cross 140/0, ASan/UBSan 9/9, CI run
 > it will be missing.
 >
 > The **repository directory itself does persist**, so the emulator and cross
-> toolchain are cached under `tools/cache/` (git-ignored). Recovery order:
+> toolchain are cached under `tools/cache/` and the two restore artefacts (the
+> cross toolchain tarball and the static `qemu-aarch64`) are **committed to the
+> repo**, so a fresh clone can restore offline. Recovery order:
 > `scripts/toolcache.sh restore` (reinstates a cached AArch64 toolchain without a
 > network), then `scripts/bootstrap.sh` only if a tool is still missing. The
 > benchmark and cross-test scripts pick up `tools/cache/bin/qemu-aarch64-static`
@@ -1051,7 +1053,8 @@ experiments/uml/run.sh clean    # remove generated images/logs
   pipeline (`scripts/dev.sh cross-test`) to execute AArch64 code.
 - **Nothing in `/usr` persists between sessions** - see the note in section 2.
   The repository directory *does* persist, so a tool cache lives at
-  `tools/cache/` (git-ignored). Recover with `scripts/toolcache.sh restore`
+  `tools/cache/` (the cross toolchain tarball and `qemu-aarch64-static` are
+  committed). Recover with `scripts/toolcache.sh restore`
   before concluding that something is broken; `scripts/bootstrap.sh` reinstalls
   and re-populates the cache.
 - **Host build tools are committed**, not just cached: `cmake`, `ninja` and

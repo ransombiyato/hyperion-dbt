@@ -38,6 +38,8 @@ bootstrap() {
 }
 
 build() {
+    # Configure on first use so `dev.sh build` works from a fresh clone.
+    [ -f "${BUILD_DIR}/CMakeCache.txt" ] || bootstrap
     cmake --build "${BUILD_DIR}"
 }
 
